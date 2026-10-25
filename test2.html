@@ -676,6 +676,7 @@ function sample(){
   if (state === "solving" || state === "speaking"){ return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
+    if (window.__mock){ (window.__dbg = window.__dbg || []).push({ t: Math.round(performance.now()), rearm: rearm, fracRef: +fracRef.toFixed(4), refThr: +refThr.toFixed(4), fracPrev: +fracPrev.toFixed(4), structStreak: structStreak, chromaStreak: chromaStreak, latchStreak: latchStreak, persistHotNow: persistHotNow, maskTotNow: maskTotNow }); }
     if (!refGrid){ enterSettling(); return; }
     if (rearm){
       // Same-question dedup: right after an answer, only a change that persists across
@@ -687,7 +688,6 @@ function sample(){
       if (structStreak >= 4 || latchStreak >= 4 || chromaStreak >= 4){ rearm = false; enterSettling(); }
       return;
     }
-    if (window.__mock){ (window.__dbg = window.__dbg || []).push({ t: Math.round(performance.now()), rearm: rearm, fracRef: +fracRef.toFixed(4), refThr: +refThr.toFixed(4), fracPrev: +fracPrev.toFixed(4), structStreak: structStreak, chromaStreak: chromaStreak, latchStreak: latchStreak, persistHotNow: persistHotNow, maskTotNow: maskTotNow }); }
     if (structuralHold || chromaHold || editLatch){ enterSettling(); return; }
     return;
   }
@@ -1092,33 +1092,23 @@ window.__quizSolver = {
 
 </script>
 <script>
-// ===== DRIVER v6: ticker dedup + realistic latencies + parser hardening =====
+// ===== DRIVER v7: THE dedup question - one text question + ticker, solved once, HELD 100s =====
 (function(){
   var m = window.__mock;
   function at(ms, fn){ setTimeout(fn, ms); }
-  m.fetchDelay = 3500;     // observed real Groq latency
-  m.speakDelay = 2500;     // realistic spoken-answer duration
-  at(50,    function(){ localStorage.setItem("vqs_provider","groq"); localStorage.setItem("vqs_key_groq","gsk_mock_key"); localStorage.removeItem("vqs_pace_v1"); });
-  at(100,   function(){ document.getElementById("btnStart").click(); });
-  // A: bars Q1 -> solve (t~5s), speech till ~8s
-  // B (12s): T1 text WITH ticking countdown (legit new question) -> must solve ONCE (~16-20s)
-  at(12000, function(){ m.textMode = true; m.scene = "T1"; m.ev("t1"); });
-  // C: HOLD T1 until 50s - ticker alone must NOT re-solve the same question
-  // D (50s): T2 full swap, ticker keeps running -> must solve
-  at(50000, function(){ m.scene = "T2"; m.ev("t2"); });
-  // E (72s): T3 one-word sparse edit, ticker running -> must solve
-  at(72000, function(){ m.scene = "T3"; m.ev("t3"); });
-  // F (95s): heavy hand jitter 12s -> no new solves
-  at(95000, function(){ m.jitter = 5; m.ev("jitter-on"); });
-  at(107000, function(){ m.jitter = 0; m.ev("jitter-off"); });
-  // G (110s): Q2 bars swap with TRUNCATED reply -> no speech, truncation logged
-  at(110000, function(){ m.truncate = true; m.textMode = false; m.scene = "Q2"; m.ev("truncate-scene"); });
-  // H (125s): T1 again with reasoning-prose reply ("... The answer is B.") -> speaks B
-  at(125000, function(){ m.truncate = false; m.replyText = "Let me check each option. A) Madrid is in Spain. C) Rome is Italy. The answer is B."; m.textMode = true; m.scene = "T1"; m.ev("prose-scene"); });
-  at(140000, function(){
+  m.fetchDelay = 3500;
+  m.speakDelay = 2500;
+  at(50,  function(){ localStorage.setItem("vqs_provider","groq"); localStorage.setItem("vqs_key_groq","gsk_mock_key"); localStorage.removeItem("vqs_pace_v1"); });
+  at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); m.ev("start-t1"); });
+  // T1 solves ~5s, speech ends ~10s. Then ticker ONLY for 90s: NO second fetch allowed.
+  at(40000, function(){ m.jitter = 5; m.ev("jitter-on"); });    // moving phone 40-55s
+  at(55000, function(){ m.jitter = 0; m.ev("jitter-off"); });
+  // G (100s): truncated reply path: Q2 bars + truncate -> fetch ~105s, no speech, truncation logged
+  at(100000, function(){ m.truncate = true; m.textMode = false; m.scene = "Q2"; m.ev("truncate-scene"); });
+  at(120000, function(){
     window.__testResult = {
       spoken: m.spoken, fetches: m.fetches, aborted: m.aborted, events: m.events,
-      dbg: (window.__dbg || []).filter(function(d){ return d.rearm; }),
+      dbg: (window.__dbg || []),
       logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent.slice(0,140); })
     };
   });
