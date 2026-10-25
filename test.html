@@ -311,8 +311,9 @@ var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4", groq:"qwen/qw
 // OpenAI-compatible providers: chat.completions endpoint + Bearer key
 var PROVIDER_API = {
   openai:     { url:"https://api.openai.com/v1/chat/completions",        label:"OpenAI",     caps:{ auto:4, manual:5 } },
-  // Groq free tier: each snapshot ~2,050 tokens against 8K tokens/min -> ~3 snapshots/min max
-  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq",       caps:{ auto:2, manual:3 } },
+  // Groq free tier: measured OTPM cap 1,000 output tokens/min; qwen3.8 reasons hundreds of tokens
+  // per answer, so auto capture stays at 1/min (manual taps may still hit the per-minute 429 - the app explains it)
+  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq",       caps:{ auto:1, manual:3 } },
   // OpenRouter free: 20 req/min shared across all free models; keep image calls conservative
   openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",     label:"OpenRouter", caps:{ auto:2, manual:3 } }
 };
@@ -334,7 +335,7 @@ var refCr = null, refCb = null, refDet = null, refDetCr = null, refDetCb = null,
 var lastCr = null, lastCb = null, lastDet = null, lastDetCr = null, lastDetCb = null;
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
-var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, rearm = false;
+var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, rearm = false, rearmCalm = 0;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
@@ -633,7 +634,13 @@ function sample(){
     if (rearm){
       // Same-question dedup: right after an answer, only a change that persists across
       // several consecutive evaluations re-arms detection - a noise burst cannot.
-      if (structStreak >= 4 || latchStreak >= 4 || chromaStreak >= 4){ rearm = false; enterSettling(); }
+      // A ticking countdown/timer on screen is different FROM the reference every second,
+      // so the persistence streaks alone re-arm on it and re-solve the same question
+      // (observed live: duplicate Groq call 11s after the answer). A real next question
+      // changes ONCE and then holds still; a ticker keeps transitioning. Require the
+      // frame-to-frame change to stay at the noise floor while the streaks build.
+      rearmCalm = fracPrev <= stableThr ? rearmCalm + 1 : 0;
+      if ((structStreak >= 4 || latchStreak >= 4 || chromaStreak >= 4) && rearmCalm >= 4){ rearm = false; enterSettling(); }
       return;
     }
     if (structuralHold || chromaHold || editLatch){ enterSettling(); return; }
@@ -848,7 +855,7 @@ async function doSolve(){
   } catch (e) {
     if (e && e.name === "AbortError") return;
     var raw = (e && e.message ? String(e.message) : String(e));
-    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/gsk_[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/sk-or-[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
+    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/gsk_[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/sk-or-[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]").replace(/org_[0-9a-z]{10,}/g, "[redacted-org]");
     log("API error: " + raw);
     if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // request finished: stop the scene-change watchdog
     consecFails++;
@@ -909,6 +916,7 @@ async function askModel(cfg, dataUrl, signal){
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.key },
       body: JSON.stringify({
         model: cfg.model,
+        max_tokens: 800,   // one letter needs almost nothing; uncapped requests reserve the model default (measured: 1365-2048) and exceed Groq free tier's 1,000 OUTPUT tokens/min
         messages: [{ role: "user", content: [ { type: "text", text: PROMPT },
           { type: "image_url", image_url: { url: dataUrl } } ] }]
       })
