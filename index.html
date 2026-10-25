@@ -100,6 +100,8 @@
   <label for="selProvider">AI provider</label>
   <select id="selProvider">
     <option value="gemini">Google Gemini</option>
+    <option value="groq">Groq (free tier)</option>
+    <option value="openrouter">OpenRouter (free tier)</option>
     <option value="openai">OpenAI</option>
   </select>
   <label for="inpKey">API key</label>
@@ -168,8 +170,16 @@ var SHARP_GATE = 0.7;         // frame must reach this fraction of the recent be
 var SHARP_WINDOW = 24;        // samples kept for the rolling sharpness baseline
 
 var LS_KEYS = { provider:"vqs_provider", model_gemini:"vqs_model_gemini", model_openai:"vqs_model_openai",
-                key_gemini:"vqs_key_gemini", key_openai:"vqs_key_openai" };
-var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4" };
+                key_gemini:"vqs_key_gemini", key_openai:"vqs_key_openai",
+                model_groq:"vqs_model_groq", key_groq:"vqs_key_groq",
+                model_openrouter:"vqs_model_openrouter", key_openrouter:"vqs_key_openrouter" };
+var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4", groq:"qwen/qwen3.8-27b", openrouter:"google/gemma-4-31b-it:free" };
+// OpenAI-compatible providers: chat.completions endpoint + Bearer key
+var PROVIDER_API = {
+  openai:     { url:"https://api.openai.com/v1/chat/completions",        label:"OpenAI" },
+  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq" },
+  openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",     label:"OpenRouter" }
+};
 
 var memStore = {};
 function storeGet(k){ try { return localStorage.getItem(k); } catch (e){ return (k in memStore) ? memStore[k] : null; } }
@@ -689,7 +699,7 @@ async function doSolve(){
   } catch (e) {
     if (e && e.name === "AbortError") return;
     var raw = (e && e.message ? String(e.message) : String(e));
-    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
+    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/gsk_[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/sk-or-[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
     log("API error: " + raw);
     if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // request finished: stop the scene-change watchdog
     consecFails++;
@@ -734,7 +744,8 @@ async function askModel(cfg, dataUrl, signal){
                  j.candidates[0].content.parts) || [];
     return parts.map(function(p){ return p.text || ""; }).join("").trim();
   } else {
-    var res2 = await fetch("https://api.openai.com/v1/chat/completions", {
+    var api = PROVIDER_API[cfg.provider] || PROVIDER_API.openai;
+    var res2 = await fetch(api.url, {
       method: "POST", signal: signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.key },
       body: JSON.stringify({
@@ -743,7 +754,7 @@ async function askModel(cfg, dataUrl, signal){
           { type: "image_url", image_url: { url: dataUrl } } ] }]
       })
     });
-    if (!res2.ok) throw new Error("OpenAI HTTP " + res2.status + ": " + (await res2.text()).slice(0, 600));
+    if (!res2.ok) throw new Error(api.label + " HTTP " + res2.status + ": " + (await res2.text()).slice(0, 600));
     var j2 = await res2.json();
     return (((j2.choices || [])[0] || {}).message || {}).content || "";
   }
@@ -813,14 +824,23 @@ function fillSettings(){
   $("selProvider").value = provider;
   $("inpKey").value = storeGet(LS_KEYS["key_" + provider]) || "";
   $("inpModel").value = storeGet(LS_KEYS["model_" + provider]) || DEFAULT_MODEL[provider];
-  $("modelNote").innerHTML = provider === "gemini"
-    ? "<b>Default: gemini-3.6-flash</b> (current stable model with image input). "
+  var NOTES = {
+    gemini: "<b>Default: gemini-3.6-flash</b> (current stable model with image input). "
       + "The Gemini 2.0 Flash from the original spec was shut down by Google on June 1, 2026, so this app "
       + "defaults to its current replacement; edit the field to use any model your key can access. "
       + "Get a key at aistudio.google.com/apikey; usage may incur charges depending on your account. "
-      + '<a href="https://aistudio.google.com/usage" target="_blank" rel="noopener">Check API usage and quota</a>.'
-    : "<b>Default: gpt-5.4</b> (vision-capable). Needs an API key from platform.openai.com; "
-      + "a ChatGPT subscription does not include API access, and API usage is billed separately per request.";
+      + '<a href="https://aistudio.google.com/usage" target="_blank" rel="noopener">Check API usage and quota</a>.',
+    groq: "<b>Default: qwen/qwen3.8-27b</b> (vision-capable). Groq's free tier allows about 30 requests/min "
+      + "and 1,000 requests/day with a free account - no Google quota issues. "
+      + "Create a free key at console.groq.com/keys. "
+      + '<a href="https://console.groq.com/settings/limits" target="_blank" rel="noopener">Check usage and limits</a>.',
+    openrouter: "<b>Default: google/gemma-4-31b-it:free</b> (vision-capable, zero-price). OpenRouter's free tier "
+      + "allows about 20 requests/min and 50 requests/day. Create a free key at openrouter.ai/keys. "
+      + '<a href="https://openrouter.ai/activity" target="_blank" rel="noopener">Check usage</a>.',
+    openai: "<b>Default: gpt-5.4</b> (vision-capable). Needs an API key from platform.openai.com; "
+      + "a ChatGPT subscription does not include API access, and API usage is billed separately per request."
+  };
+  $("modelNote").innerHTML = NOTES[provider] || NOTES.gemini;
 }
 function openSheet(){ fillSettings(); $("sheet").classList.add("open"); }
 
