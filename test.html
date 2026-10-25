@@ -349,6 +349,10 @@ var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
 var autoPaused = false, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
 var reqTimes = [];            // every API attempt (auto, manual, failed, aborted) in the last 60s
+try {   // survive page refresh so a reload cannot bypass the provider rate window
+  reqTimes = (JSON.parse(localStorage.getItem("vqs_pace_v1") || "[]") || []).filter(function(t){ return Date.now() - t < 60000; });
+} catch (e) { reqTimes = []; }
+function savePace(){ try { localStorage.setItem("vqs_pace_v1", JSON.stringify(reqTimes.slice(-12))); } catch (e) {} }
 var RPM_CAP_AUTO = 4;         // provider free tier is 5 requests/min; auto keeps one slot spare for the user
 var RPM_CAP_MANUAL = 5;
 var pendingAuto = false, paceTimer = null, paceTicker = null; // single-slot queue: only the LATEST question is ever queued
@@ -726,7 +730,7 @@ function stopSettle(){
 function interruptBusy(){
   log("Scene changed while busy - discarding stale result");
   reqSeq++;                                  // invalidates in-flight request and speech callbacks
-  if (aborter){ aborter.abort(); }
+  if (aborter && state === "solving"){ aborter.abort(); }
   try { window.speechSynthesis.cancel(); } catch (e) {}
   toast.classList.remove("show");
   lastSpokenAt = 0;                          // old answer discarded; the new question may solve now
@@ -803,8 +807,9 @@ async function doSolve(){
   if (paceTimer){ clearTimeout(paceTimer); paceTimer = null; }
   if (paceTicker){ clearInterval(paceTicker); paceTicker = null; }
   reqTimes.push(Date.now());   // every attempt counts against the provider rate window
+  savePace();
   var mySeq = ++reqSeq;
-  if (aborter) aborter.abort();
+  if (aborter && state === "solving"){ aborter.abort(); }  // a prior request is still in flight
   aborter = new AbortController();
   stopSettle();
   clearInterval(monitorTimer); monitorTimer = null;
@@ -996,27 +1001,27 @@ window.__quizSolver = {
   function at(ms, fn){ setTimeout(fn, ms); }
   function ev(s){ m.ev(s + " @" + Math.round(performance.now() - T0)); }
   at(100,   function(){ document.getElementById("btnStart").click(); });
-  // A: static bars Q1 under camera noise -> solve "Answer B" once (~2-5s)
-  // B (11s): small-text T1 -> solve "Answer D"
-  at(11000, function(){ m.textMode = true; m.scene = "T1"; ev("t1"); });
-  // B2 (16.5-19.5s): extra hand jitter ON THE TEXT SCREEN -> no fetch, no dup
-  at(16500, function(){ m.jitter = 4; ev("jitter-on"); });
-  at(19500, function(){ m.jitter = 0; ev("jitter-off"); });
-  // D (18s): green answer-highlight T1H -> NO solve; adopt + feedback log
-  at(21000, function(){ m.scene = "T1H"; ev("t1-highlight"); });
-  // E (23s): highlight reverts -> adopt, no solve
-  at(26000, function(){ m.scene = "T1"; ev("t1-revert"); });
-  // F (27s): full small-text swap T2 -> solve "Answer A"
-  at(30000, function(){ m.scene = "T2"; ev("t2"); });
-  // G (34s): one-word sparse edit T3 -> MUST solve "Answer A" via sparse path
-  at(37000, function(){ m.scene = "T3"; ev("t3-oneword"); });
-  // H (47s): provider starts rejecting with 429 quota -> one auto attempt, then HARD PAUSE
-  at(47000, function(){ m.fail429 = true; m.scene = "T1"; ev("quota-on-t1"); });
-  // I (54s): another scene change while paused -> must produce NO fetch
-  at(54000, function(){ m.scene = "T2"; ev("paused-scene-change"); });
-  // J (58.5s): quota restored + manual tap -> intentional retry solves
-  at(58500, function(){ m.fail429 = false; document.getElementById("btnCapture").click(); ev("manual-retry"); });
-  at(66000, function(){
+  // A: static bars Q1 under camera noise -> solve "Answer B" (~1-4s); synthetic corner may re-solve once (~7s)
+  // B (15s): small-text T1 -> solve "Answer D"
+  at(15000, function(){ m.textMode = true; m.scene = "T1"; ev("t1"); });
+  // B2 (20-23s): extra hand jitter ON THE TEXT SCREEN -> no fetch while jittering
+  at(20000, function(){ m.jitter = 4; ev("jitter-on"); });
+  at(23000, function(){ m.jitter = 0; ev("jitter-off"); });
+  // D (26s): green answer-highlight T1H -> NO solve; adopt + feedback log
+  at(26000, function(){ m.scene = "T1H"; ev("t1-highlight"); });
+  // E (30s): highlight reverts -> adopt, no solve
+  at(30000, function(){ m.scene = "T1"; ev("t1-revert"); });
+  // F (34s): full small-text swap T2 -> pacing queue (window full) -> solve "Answer A" after oldest attempt ages out
+  at(34000, function(){ m.scene = "T2"; ev("t2"); });
+  // G (40s): one-word sparse edit T3 -> replaces queued candidate (latest-question queue, no accumulation)
+  at(40000, function(){ m.scene = "T3"; ev("t3-oneword"); });
+  // H (70s): provider starts rejecting with 429 quota -> window has room -> one auto attempt, then HARD PAUSE
+  at(70000, function(){ m.fail429 = true; m.scene = "T1"; ev("quota-on-t1"); });
+  // I (76s): another scene change while paused -> must produce NO fetch
+  at(76000, function(){ m.scene = "T2"; ev("paused-scene-change"); });
+  // J (81s): quota restored + manual tap -> intentional retry solves
+  at(81000, function(){ m.fail429 = false; document.getElementById("btnCapture").click(); ev("manual-retry"); });
+  at(88000, function(){
     window.__testResult = {
       spoken: m.spoken, fetches: m.fetches, aborted: m.aborted, events: m.events,
       logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent; })
