@@ -639,7 +639,7 @@ window.__quizSolver = {
   // Phase B (7-12s): same Q1 with handheld jitter +-4px -> must NOT solve again
   at(7000,  function(){ ev("jitter-on"); m.jitter = 4; });
   // Phase C (12s): Q2 appears but heavily blurred -> detect change, wait for clarity, no solve yet
-  at(12000, function(){ ev("q2-blurred"); m.jitter = 0; m.blur = 5; m.scene = "Q2"; });
+  at(12000, function(){ ev("q2-blurred"); m.jitter = 0; m.blur = 12; m.scene = "Q2"; });
   // Phase C2 (15s): picture clears -> must auto-solve and speak "Answer C"
   at(15000, function(){ ev("q2-clear"); m.blur = 0; });
   // Phase D (18.5-22s): static Q2 -> no duplicate solve
