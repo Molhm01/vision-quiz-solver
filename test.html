@@ -371,7 +371,7 @@ function log(msg){
   var line = document.createElement("div");
   line.textContent = new Date().toLocaleTimeString() + "  " + msg;
   logBox.insertBefore(line, logBox.firstChild);
-  while (logBox.children.length > 6) logBox.removeChild(logBox.lastChild);
+  while (logBox.children.length > 30) logBox.removeChild(logBox.lastChild);   // keep enough history that a 429 body stays readable in the expanded log
 }
 logBox.addEventListener("click", function(){ logBox.classList.toggle("open"); });   // tap the log to read/copy long errors
 
