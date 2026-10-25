@@ -134,7 +134,7 @@
     camera and voice. Voice answers use your phone's built-in speech.</p>
 </div>
 
-<canvas id="sampleCanvas" width="48" height="36" style="display:none"></canvas>
+<canvas id="sampleCanvas" width="80" height="60" style="display:none"></canvas>
 <canvas id="sharpCanvas" width="96" height="72" style="display:none"></canvas>
 
 <script>
@@ -144,7 +144,8 @@
     scene: "Q1", jitter: 0, blur: 0,
     spoken: [], fetches: [], aborted: 0,
     fetchDelay: 2500,
-    answerMap: { Q1: "B", Q2: "C", Q3: "A" },
+    answerMap: { Q1: "B", Q2: "C", Q3: "A", T1: "D", T2: "A", T3: "A" },
+    textMode: false,
     events: []
   };
   function ev(name){ mock.events.push({ t: Math.round(performance.now()), ev: name }); }
@@ -165,15 +166,31 @@
     // room + screen bezel: identical across scenes, overscanned so jitter shows no borders
     c.fillStyle = "#101418"; c.fillRect(-40, -40, 1360, 800);
     c.fillStyle = "#1c2530"; c.fillRect(100, 60, 1080, 600);
-    // scene "text lines": bright bars whose positions/lengths differ per scene
-    c.fillStyle = "#e8eef2";
-    var seed = mock.scene === "Q1" ? 1 : mock.scene === "Q2" ? 2 : 3;
-    var rnd = mulberry(seed * 99991);
-    for (var i = 0; i < 12; i++){
-      if (rnd() > 0.88) continue;             // some rows absent per scene
-      var w = 300 + rnd()*650, h = 20;
-      var x = 140 + rnd()*180, y = 110 + i*44;
-      c.fillRect(x, y, w, h);
+    if (mock.textMode){
+      // realistic small-font quiz text (~20px on 720p ~ 36px on a 1080p phone frame)
+      var LINES = {
+        T1: ["What is the capital of France?", "A) Madrid", "B) Paris", "C) Rome", "D) Berlin"],
+        T2: ["Which planet is known as the Red Planet?", "A) Mars", "B) Venus", "C) Jupiter", "D) Mercury"],
+        T3: ["Which planet is known as the Red Planet?", "A) Mars", "B) Venus", "C) Saturn", "D) Mercury"]
+      };
+      c.fillStyle = "#e8eef2";
+      c.font = "20px sans-serif";
+      var lines = LINES[mock.scene] || LINES.T1;
+      for (var li = 0; li < lines.length; li++) c.fillText(lines[li], 160, 180 + li * 60);
+      // small ticking countdown in the corner: must NOT trigger solves
+      c.font = "16px sans-serif";
+      c.fillText("0:" + String(Math.floor(performance.now() / 1000) % 60).padStart(2, "0"), 1100, 110);
+    } else {
+      // scene "text lines": bright bars whose positions/lengths differ per scene
+      c.fillStyle = "#e8eef2";
+      var seed = mock.scene === "Q1" ? 1 : mock.scene === "Q2" ? 2 : 3;
+      var rnd = mulberry(seed * 99991);
+      for (var i = 0; i < 12; i++){
+        if (rnd() > 0.88) continue;             // some rows absent per scene
+        var w = 300 + rnd()*650, h = 20;
+        var x = 140 + rnd()*180, y = 110 + i*44;
+        c.fillRect(x, y, w, h);
+      }
     }
     c.restore();
   }
@@ -231,15 +248,17 @@
 "use strict";
 var PROMPT = "You are an automated multiple-choice quiz solver. Solve the question visible in the image. Return ONLY the letter of the correct answer (e.g., A, B, C, or D). Do not provide any explanation, markdown, or extra words.";
 
-var CMP_W = 48, CMP_H = 36;  // coarse comparison grid: text edits register, camera jitter averages out
+var CMP_W = 80, CMP_H = 60;  // comparison grid: fine enough for quiz text, compared with alignment tolerance
 var SH_W = 96, SH_H = 72;    // finer grid for the sharpness (blur) estimate
 var MONITOR_MS = 400;         // frame sample cadence while watching
 var BUSY_WATCH_MS = 400;      // watchdog cadence while solving/speaking/cooldown
 var SETTLE_MS = 150;          // faster cadence while waiting for a stable, clear frame
-var PIXEL_THR = 32;           // per-pixel gray change (0-255) that counts a pixel as changed
-var CHANGE_FRAC = 0.025;      // changed-pixel fraction vs the answered scene that means new content
-var MAJOR_CHANGE_FRAC = 0.06; // larger change that also interrupts speech in progress
-var STABLE_FRAC = 0.01;       // changed-pixel fraction between consecutive frames that still counts as still
+var PIXEL_THR = 32;           // gray change (0-255) beyond the local neighborhood range that counts a pixel as changed
+var CHANGE_FRAC = 0.003;      // whole-frame changed fraction vs the answered scene that means new content (~one text line)
+var TILE_W = 8, TILE_H = 6;   // the comparison grid is divided into 8x6 tiles of 10x10 cells
+var TILE_FRAC = 0.05;         // any single tile this changed means a meaningful local edit (one word/number/option)
+var MAJOR_CHANGE_FRAC = 0.04; // larger whole-frame change that also interrupts speech in progress
+var STABLE_FRAC = 0.002;      // changed-pixel fraction between consecutive frames that still counts as still
 var STABLE_NEEDED_MS = 450;   // scene must stay still this long before auto-capture
 var SETTLE_TIMEOUT_MS = 10000;// stop waiting for perfect stillness and capture best effort
 var COOLDOWN_MS = 2500;       // quiet period right after an answer is read
@@ -322,12 +341,52 @@ function unlockSpeech(){
    frame), so a text-only change registers even when the phone never moves.
    Stillness compares consecutive frames; small hand jitter stays under the
    per-pixel threshold, so it no longer resets the wait. */
-function changedFrac(a, b){
-  var changed = 0;
-  for (var i = 0; i < a.length; i++){
-    if (Math.abs(a[i] - b[i]) > PIXEL_THR) changed++;
+// A pixel counts as changed only when its gray level falls outside the min/max range
+// of the 3x3 neighborhood around the same position in the other frame. Sub-cell hand
+// jitter shifts values smoothly inside that range (absorbed), while new or removed
+// text has no matching value nearby (counted).
+function changedMask(a, b){
+  var mask = new Uint8Array(CMP_W * CMP_H);
+  for (var y = 0; y < CMP_H; y++){
+    for (var x = 0; x < CMP_W; x++){
+      var lo = 255, hi = 0;
+      for (var dy = -1; dy <= 1; dy++){
+        var yy = y + dy;
+        if (yy < 0 || yy >= CMP_H) continue;
+        for (var dx = -1; dx <= 1; dx++){
+          var xx = x + dx;
+          if (xx < 0 || xx >= CMP_W) continue;
+          var v = b[yy * CMP_W + xx];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+      var d = a[y * CMP_W + x];
+      if (d < lo - PIXEL_THR || d > hi + PIXEL_THR) mask[y * CMP_W + x] = 1;
+    }
   }
-  return changed / a.length;
+  return mask;
+}
+// Two views of the same change mask: the whole-frame fraction catches big content
+// changes, while the hottest 10x10-cell tile catches meaningful sparse edits
+// (a changed word, number, operator or answer option) that a global average dilutes.
+function maskStats(mask){
+  var changed = 0;
+  var tiles = new Uint16Array(TILE_W * TILE_H);
+  for (var y = 0; y < CMP_H; y++){
+    for (var x = 0; x < CMP_W; x++){
+      if (mask[y * CMP_W + x]){
+        changed++;
+        tiles[((y / 10) | 0) * TILE_W + ((x / 10) | 0)]++;
+      }
+    }
+  }
+  var maxTile = 0;
+  for (var t = 0; t < tiles.length; t++){
+    var f = tiles[t] / 100;
+    if (f > maxTile) maxTile = f;
+  }
+  return { frac: changed / mask.length, maxTile: maxTile };
 }
 function sample(){
   if (document.hidden || !video.videoWidth) return;
@@ -351,33 +410,34 @@ function sample(){
       var gx = shdata[p+4]   * 0.299 + shdata[p+5] * 0.587 + shdata[p+6] * 0.114;
       var q  = p + SH_W * 4;
       var gy = shdata[q]     * 0.299 + shdata[q+1] * 0.587 + shdata[q+2] * 0.114;
-      sharpSum += Math.abs(g - gx) + Math.abs(g - gy);
-      sharpCount += 2;
+      var grad = Math.abs(g - gx) + Math.abs(g - gy);
+      if (grad > 8){ sharpSum += grad; sharpCount++; }   // edge-active pixels only, so fixed hard edges do not dominate
     }
   }
-  var sharp = sharpSum / sharpCount;
+  var sharp = sharpCount ? sharpSum / sharpCount : 0;
   sharpHist.push(sharp);
   if (sharpHist.length > SHARP_WINDOW) sharpHist.shift();
   lastGrid = gray;
 
-  var fracRef = refGrid ? changedFrac(gray, refGrid) : 0;
-  var fracPrev = prevGrid ? changedFrac(gray, prevGrid) : 0;
+  var fracRef = 0, tileRef = 0, fracPrev = 0;
+  if (refGrid){ var stRef = maskStats(changedMask(gray, refGrid)); fracRef = stRef.frac; tileRef = stRef.maxTile; }
+  if (prevGrid) fracPrev = maskStats(changedMask(gray, prevGrid)).frac;
   prevGrid = gray;
   lastDiff = fracRef;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(1) + "%";
 
-  if (state === "solving" && refGrid && fracRef > CHANGE_FRAC){ interruptBusy(); return; }
+  if (state === "solving" && refGrid && (fracRef > CHANGE_FRAC || tileRef > TILE_FRAC)){ interruptBusy(); return; }
   if (state === "speaking" && refGrid && fracRef > MAJOR_CHANGE_FRAC){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
-    if (!refGrid || fracRef > CHANGE_FRAC) enterSettling();
+    if (!refGrid || fracRef > CHANGE_FRAC || tileRef > TILE_FRAC) enterSettling();
     return;
   }
   if (state === "settling"){
     if (fracPrev < STABLE_FRAC){
       if (!settleSince) settleSince = performance.now();
       if (performance.now() - settleSince >= STABLE_NEEDED_MS){
-        if (refGrid && fracRef < CHANGE_FRAC){
+        if (refGrid && fracRef < CHANGE_FRAC && tileRef < TILE_FRAC){
           stopSettle();
           log("Same question as before - not solving");
           resumeMonitor(0);
@@ -399,7 +459,7 @@ function sample(){
     }
     if (performance.now() - settleStart > SETTLE_TIMEOUT_MS){
       stopSettle();
-      if (refGrid && fracRef < CHANGE_FRAC){
+      if (refGrid && fracRef < CHANGE_FRAC && tileRef < TILE_FRAC){
         log("Scene settled back - not solving");
         resumeMonitor(0);
         return;
@@ -647,7 +707,14 @@ window.__quizSolver = {
   at(22000, function(){ m.fetchDelay = 3000; m.scene = "Q3"; ev("q3"); });
   at(24500, function(){ m.scene = "Q1"; ev("q1-again-midflight"); });
   // Expect: Q3 request aborted, stale answer discarded, only Q1 re-solved and spoken ("Answer B")
-  at(33000, function(){
+  // Phase F (34s): switch to realistic small-font text scene T1 -> must solve and speak "Answer D"
+  at(34000, function(){ m.textMode = true; m.scene = "T1"; ev("text-t1"); });
+  // Phase G (42s): full small-font question change T1 -> T2 -> must solve and speak "Answer A"
+  at(42000, function(){ m.scene = "T2"; ev("text-t2"); });
+  // Phase H (50s): sparse edit T2 -> T3 (one option word) -> MUST trigger and speak "Answer A"
+  at(50000, function(){ m.scene = "T3"; ev("text-t3-oneword"); });
+  // Phase I (54-64s): static T3 with only the corner timer ticking -> no further fetches
+  at(66000, function(){
     clearInterval(poller);
     var result = {
       spoken: m.spoken,
