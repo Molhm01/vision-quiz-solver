@@ -177,8 +177,9 @@ var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4", groq:"qwen/qw
 // OpenAI-compatible providers: chat.completions endpoint + Bearer key
 var PROVIDER_API = {
   openai:     { url:"https://api.openai.com/v1/chat/completions",        label:"OpenAI",     caps:{ auto:4, manual:5 } },
-  // Groq free tier: each snapshot ~2,050 tokens against 8K tokens/min -> ~3 snapshots/min max
-  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq",       caps:{ auto:2, manual:3 } },
+  // Groq free tier: measured OTPM cap 1,000 output tokens/min; qwen3.8 reasons hundreds of tokens
+  // per answer, so auto capture stays at 1/min (manual taps may still hit the per-minute 429 - the app explains it)
+  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq",       caps:{ auto:1, manual:3 } },
   // OpenRouter free: 20 req/min shared across all free models; keep image calls conservative
   openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",     label:"OpenRouter", caps:{ auto:2, manual:3 } }
 };
@@ -499,6 +500,10 @@ function sample(){
     if (rearm){
       // Same-question dedup: right after an answer, only a change that persists across
       // several consecutive evaluations re-arms detection - a noise burst cannot.
+      // KNOWN OPEN ISSUE (grounded in a real provider run): an on-screen ticking
+      // countdown keeps these streaks hot and can re-solve the SAME question ~11s
+      // after the answer. A calm-based suppression was tried and reverted: it also
+      // blocked legitimate questions that APPEAR together with a running timer.
       if (structStreak >= 4 || latchStreak >= 4 || chromaStreak >= 4){ rearm = false; enterSettling(); }
       return;
     }
@@ -714,7 +719,7 @@ async function doSolve(){
   } catch (e) {
     if (e && e.name === "AbortError") return;
     var raw = (e && e.message ? String(e.message) : String(e));
-    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/gsk_[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/sk-or-[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
+    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/gsk_[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/sk-or-[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]").replace(/org_[0-9a-z]{10,}/g, "[redacted-org]");
     log("API error: " + raw);
     if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // request finished: stop the scene-change watchdog
     consecFails++;
@@ -775,6 +780,7 @@ async function askModel(cfg, dataUrl, signal){
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.key },
       body: JSON.stringify({
         model: cfg.model,
+        max_tokens: 800,   // one letter needs almost nothing; uncapped requests reserve the model default (measured: 1365-2048) and exceed Groq free tier's 1,000 OUTPUT tokens/min
         messages: [{ role: "user", content: [ { type: "text", text: PROMPT },
           { type: "image_url", image_url: { url: dataUrl } } ] }]
       })
