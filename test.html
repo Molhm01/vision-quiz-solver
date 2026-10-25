@@ -336,7 +336,7 @@ var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
-var editLatch = false;   // a persistent localized edit was observed vs the current reference
+var editLatch = false, latchStreak = 0;   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
 
@@ -540,7 +540,7 @@ function sample(){
   }
   structStreak = structural ? structStreak + 1 : 0;
   chromaStreak = chromatic ? chromaStreak + 1 : 0;
-  var persistHotNow = 0;
+  var persistHotNow = 0, persistHot5 = 0;
   // Cell-level persistence ring: a cell counts when its luma changed and the change is
   // luma-dominant (ink, not color feedback). A tile is persist-hot when >=SPARSE_MIN of
   // its cells changed in >=3 of the last 5 samples. Measured on the noisy mock: camera
@@ -573,17 +573,26 @@ function sample(){
         var rm = hotRing[ri];
         for (var rp = 0; rp < rm.length; rp++) cellCnt[rp] += rm[rp];
       }
-      var need = Math.min(3, hotRing.length);
       var tilesP = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
+      var tilesP5 = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
       for (var py = 0; py < DET_H; py++){
         for (var px = 0; px < DET_W; px++){
           var pp = py * DET_W + px;
-          if (cellCnt[pp] >= need) tilesP[((py / DET_TILE) | 0) * (DET_W / DET_TILE) + ((px / DET_TILE) | 0)]++;
+          var cc = cellCnt[pp];
+          var ti = ((py / DET_TILE) | 0) * (DET_W / DET_TILE) + ((px / DET_TILE) | 0);
+          if (cc >= 3) tilesP[ti]++;
+          if (cc >= 5) tilesP5[ti]++;
         }
       }
-      for (var pt = 0; pt < tilesP.length; pt++) if (tilesP[pt] >= SPARSE_MIN) persistHot++;
+      for (var pt = 0; pt < tilesP.length; pt++){
+        if (tilesP[pt] >= SPARSE_MIN) persistHot++;
+        if (tilesP5[pt] >= SPARSE_MIN) persistHot5++;
+      }
       persistHotNow = persistHot;
-      if (persistHot >= 1) editLatch = true;   // latched: stays until the reference changes
+      // latch needs a hot tile in two consecutive ring evaluations: a one-word edit
+      // re-qualifies constantly; a noise fluke does not
+      latchStreak = persistHot >= 1 ? latchStreak + 1 : 0;
+      if (latchStreak >= 2) editLatch = true;   // latched: stays until the reference changes
     }
   }
   sparseHot = editLatch ? 1 : 0;
@@ -596,7 +605,7 @@ function sample(){
   // Mid-solve interruption is reserved for a widespread persistent change (a full new
   // question). A sparse edit mid-solve is not interrupted: the stale answer may speak,
   // then monitoring detects the edit and solves the new question right after.
-  if ((state === "solving" || state === "speaking") && refGrid && persistHotNow >= 4){ interruptBusy(); return; }
+  if ((state === "solving" || state === "speaking") && refGrid && hotRing.length >= 5 && persistHot5 >= 4){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
@@ -650,7 +659,7 @@ function adoptReference(){
   refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
   refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
   refEdgeDil = dilate(edgeMap(lastDet));
-  hotRing = []; editLatch = false; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
+  hotRing = []; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
   state = "settling";
@@ -709,7 +718,7 @@ async function doSolve(){
     refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
     refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
     refEdgeDil = dilate(edgeMap(lastDet));
-    hotRing = []; editLatch = false; structStreak = 0; chromaStreak = 0;
+    hotRing = []; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;
   }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
