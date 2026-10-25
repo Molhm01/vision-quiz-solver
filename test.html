@@ -540,19 +540,34 @@ function sample(){
   }
   structStreak = structural ? structStreak + 1 : 0;
   chromaStreak = chromatic ? chromaStreak + 1 : 0;
+  var persistHotNow = 0;
   // Cell-level persistence ring: a cell counts when its luma changed and the change is
   // luma-dominant (ink, not color feedback). A tile is persist-hot when >=SPARSE_MIN of
   // its cells changed in >=3 of the last 5 samples. Measured on the noisy mock: camera
   // noise NEVER produces one (0/23 samples), a one-word edit does (up to 3 tiles).
   if (refGrid && refDet){
-    var mask = new Uint8Array(DET_W * DET_H);
-    for (var mp = 0; mp < DET_W * DET_H; mp++){
-      var mdl = Math.abs(det[mp] - refDet[mp]);
-      if (mdl > PIXEL_THR && Math.abs(detCr[mp] - refDetCr[mp]) + Math.abs(detCb[mp] - refDetCb[mp]) <= mdl) mask[mp] = 1;
+    // Handheld jitter shifts the whole frame coherently: align to the best of 9
+    // sub-tile shifts before diffing so shake cancels but localized edits remain.
+    var bestMask = null, bestCount = Infinity;
+    for (var sy = -1; sy <= 1; sy++){
+      for (var sx = -1; sx <= 1; sx++){
+        var m2 = new Uint8Array(DET_W * DET_H), cnt2 = 0;
+        for (var my2 = 1; my2 < DET_H - 1; my2++){
+          var ry = my2 + sy;
+          for (var mx2 = 1; mx2 < DET_W - 1; mx2++){
+            var mp = my2 * DET_W + mx2, rp = ry * DET_W + (mx2 + sx);
+            var mdl = Math.abs(det[mp] - refDet[rp]);
+            if (mdl > PIXEL_THR && Math.abs(detCr[mp] - refDetCr[rp]) + Math.abs(detCb[mp] - refDetCb[rp]) <= mdl){ m2[mp] = 1; cnt2++; }
+          }
+        }
+        if (cnt2 < bestCount){ bestCount = cnt2; bestMask = m2; }
+      }
     }
+    var mask = bestMask;
     hotRing.push(mask);
     if (hotRing.length > 5) hotRing.shift();
-    if (hotRing.length >= 3 && !editLatch){
+    var persistHot = 0;
+    if (hotRing.length >= 3){
       var cellCnt = new Uint8Array(DET_W * DET_H);
       for (var ri = 0; ri < hotRing.length; ri++){
         var rm = hotRing[ri];
@@ -566,8 +581,8 @@ function sample(){
           if (cellCnt[pp] >= need) tilesP[((py / DET_TILE) | 0) * (DET_W / DET_TILE) + ((px / DET_TILE) | 0)]++;
         }
       }
-      var persistHot = 0;
       for (var pt = 0; pt < tilesP.length; pt++) if (tilesP[pt] >= SPARSE_MIN) persistHot++;
+      persistHotNow = persistHot;
       if (persistHot >= 1) editLatch = true;   // latched: stays until the reference changes
     }
   }
@@ -578,7 +593,10 @@ function sample(){
   lastTile = sparseHot;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(2) + "%";
 
-  if ((state === "solving" || state === "speaking") && refGrid && editLatch){ interruptBusy(); return; }
+  // Mid-solve interruption is reserved for a widespread persistent change (a full new
+  // question). A sparse edit mid-solve is not interrupted: the stale answer may speak,
+  // then monitoring detects the edit and solves the new question right after.
+  if ((state === "solving" || state === "speaking") && refGrid && persistHotNow >= 4){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
