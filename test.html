@@ -684,24 +684,81 @@ window.__quizSolver = {
 };
 </script>
 <script>
-// ===== DIAGNOSTIC DRIVER (metric probe run) =====
+// ===== DIAGNOSTIC DRIVER v2 (standalone metric probe; does not rely on app internals) =====
 (function(){
-  var m = window.__mock, qs = window.__quizSolver;
+  var m = window.__mock;
   var T0 = performance.now();
+  var video = document.getElementById("cam");
   var samples = [];
-  var poll = setInterval(function(){
-    samples.push({ t: Math.round(performance.now() - T0), state: qs.state,
-                   frac: +qs.lastDiff.toFixed(4), tile: +qs.lastTile.toFixed(3) });
-  }, 500);
-  function at(ms, fn){ setTimeout(fn, ms); }
+
+  function gridify(W, H){
+    var cv = document.createElement("canvas");
+    cv.width = W; cv.height = H;
+    var cx = cv.getContext("2d", { willReadFrequently: true });
+    return function grab(){
+      cx.drawImage(video, 0, 0, W, H);
+      var d = cx.getImageData(0, 0, W, H).data;
+      var g = new Float32Array(W * H);
+      for (var i = 0, j = 0; i < d.length; i += 4, j++) g[j] = d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114;
+      return g;
+    };
+  }
+  var grab80 = gridify(80, 60), grab160 = gridify(160, 120);
+
+  function plainFrac(a, b, thr){ var c = 0; for (var i = 0; i < a.length; i++) if (Math.abs(a[i]-b[i]) > thr) c++; return c / a.length; }
+  function plainTile(a, b, thr, W, H){
+    var TW = W/10|0, TH = H/10|0, tiles = new Uint16Array(TW*TH);
+    for (var y = 0; y < H; y++) for (var x = 0; x < W; x++)
+      if (Math.abs(a[y*W+x]-b[y*W+x]) > thr) tiles[((y/10)|0)*TW + ((x/10)|0)]++;
+    var mx = 0; for (var t = 0; t < tiles.length; t++) if (tiles[t]/100 > mx) mx = tiles[t]/100;
+    return mx;
+  }
+  function ink(g, W, H){
+    var out = new Uint8Array(W*H);
+    var win = new Float32Array(9);
+    for (var y = 1; y < H-1; y++) for (var x = 1; x < W-1; x++){
+      var n = 0;
+      for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) win[n++] = g[(y+dy)*W+(x+dx)];
+      win.sort();
+      var med = win[4], v = g[y*W+x];
+      if (v - med > 48 || med - v > 48) out[y*W+x] = 1;
+    }
+    return out;
+  }
+  function xorFrac(a, b){ var c = 0; for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) c++; return c / a.length; }
+  function xorTile(a, b, W, H){
+    var TW = W/10|0, TH = H/10|0, tiles = new Uint16Array(TW*TH);
+    for (var y = 0; y < H; y++) for (var x = 0; x < W; x++)
+      if (a[y*W+x] !== b[y*W+x]) tiles[((y/10)|0)*TW + ((x/10)|0)]++;
+    var mx = 0; for (var t = 0; t < tiles.length; t++) if (tiles[t]/100 > mx) mx = tiles[t]/100;
+    return mx;
+  }
+
+  var ref80 = null, ref160 = null, refInk = null, prev160 = null;
   at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); });
-  // 0-10s: static small-text T1 with ticking corner timer (post-solve = noise floor)
-  at(10000, function(){ m.jitter = 4; });                    // 10-20s: + handheld jitter
-  at(20000, function(){ m.jitter = 0; m.scene = "T2"; });    // 20s: full small-text question change
-  at(30000, function(){ m.scene = "T3"; });                  // 30s: one-word option change
+  at(5000, function(){ ref80 = grab80(); ref160 = grab160(); refInk = ink(ref160, 160, 120); prev160 = ref160; });
+  at(10000, function(){ m.jitter = 4; });
+  at(20000, function(){ m.jitter = 0; m.scene = "T2"; });
+  at(30000, function(){ m.scene = "T3"; });
+  function at(ms, fn){ setTimeout(fn, ms); }
+  var poll = setInterval(function(){
+    if (!ref80) return;
+    var g80 = grab80(), g160 = grab160(), gi = ink(g160, 160, 120);
+    samples.push({
+      t: Math.round(performance.now() - T0),
+      f80_32: +plainFrac(g80, ref80, 32).toFixed(4),
+      t80_32: +plainTile(g80, ref80, 32, 80, 60).toFixed(3),
+      f80_16: +plainFrac(g80, ref80, 16).toFixed(4),
+      t80_16: +plainTile(g80, ref80, 16, 80, 60).toFixed(3),
+      inkF: +xorFrac(gi, refInk).toFixed(4),
+      inkT: +xorTile(gi, refInk, 160, 120).toFixed(3),
+      prev160_32: +plainFrac(g160, prev160, 32).toFixed(4)
+    });
+    prev160 = g160;
+  }, 500);
   at(40000, function(){
     clearInterval(poll);
-    window.__testResult = { samples: samples, fetches: m.fetches, spoken: m.spoken, events: m.events };
+    window.__testResult = { samples: samples, fetches: m.fetches, spoken: m.spoken };
   });
 })();
 </script>
