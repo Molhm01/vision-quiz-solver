@@ -123,8 +123,9 @@
 
 <div id="startOverlay">
   <h1>Vision Quiz Solver</h1>
-  <p class="sub">Point the back camera at a test screen. When the screen changes and settles,
-    the app reads the new question and speaks the answer letter out loud.</p>
+  <p class="sub">Point the back camera at a test screen and leave it there. When a new question
+    appears and the picture is clear, the app reads it and speaks the answer out loud -
+    no buttons, no need to hold perfectly still.</p>
   <p class="sub">1. Open Settings and paste an API key &nbsp; 2. Tap Start Camera &nbsp;
     3. Align the screen inside the box</p>
   <button id="btnStart" class="primary">Start Camera</button>
@@ -133,20 +134,31 @@
     camera and voice. Voice answers use your phone's built-in speech.</p>
 </div>
 
-<canvas id="sampleCanvas" width="160" height="120" style="display:none"></canvas>
+<canvas id="sampleCanvas" width="80" height="60" style="display:none"></canvas>
+<canvas id="sharpCanvas" width="96" height="72" style="display:none"></canvas>
 
 <script>
 "use strict";
 var PROMPT = "You are an automated multiple-choice quiz solver. Solve the question visible in the image. Return ONLY the letter of the correct answer (e.g., A, B, C, or D). Do not provide any explanation, markdown, or extra words.";
-var SAMPLE_W = 160, SAMPLE_H = 120;
-var MONITOR_MS = 800;          // frame sample cadence while watching
+
+var CMP_W = 80, CMP_H = 60;  // comparison grid: fine enough for quiz text, compared with alignment tolerance
+var SH_W = 96, SH_H = 72;    // finer grid for the sharpness (blur) estimate
+var MONITOR_MS = 400;         // frame sample cadence while watching
 var BUSY_WATCH_MS = 400;      // watchdog cadence while solving/speaking/cooldown
-var SETTLE_MS = 200;           // faster cadence while waiting for a stable scene
-var CHANGE_THRESHOLD = 20;     // mean abs gray diff (0-255) that counts as a major transition
-var STABLE_THRESHOLD = 8;      // diff below this counts as still
-var STABLE_NEEDED_MS = 1000;   // scene must stay still this long before solving
-var SETTLE_TIMEOUT_MS = 8000;  // give up waiting for stability and resume watching
-var COOLDOWN_MS = 3000;        // ignore re-triggers this long after an answer is read
+var SETTLE_MS = 150;          // faster cadence while waiting for a stable, clear frame
+var PIXEL_THR = 32;           // per-cell gray change (0-255) that counts a cell as changed
+var CHANGE_FRAC = 0.0005;     // whole-frame changed fraction vs the answered scene that means new content
+var TILE_W = 8, TILE_H = 6;   // the comparison grid is divided into 8x6 tiles of 10x10 cells
+var TILE_FRAC = 0.008;        // any single tile this changed, twice in a row, means a meaningful local edit (word/number/option)
+// Measured on realistic 20px quiz text (720p): jitter and a small ticking timer read 0.00,
+// a full question swap reads ~0.0017 whole-frame / ~0.03 hottest tile.
+var STABLE_FRAC = 0.01;       // changed-cell fraction between consecutive frames that still counts as still
+var STABLE_NEEDED_MS = 450;   // scene must stay still this long before auto-capture
+var SETTLE_TIMEOUT_MS = 10000;// stop waiting for perfect stillness and capture best effort
+var COOLDOWN_MS = 2500;       // quiet period right after an answer is read
+var SHARP_GATE = 0.7;         // frame must reach this fraction of the recent best sharpness to auto-capture
+var SHARP_WINDOW = 24;        // samples kept for the rolling sharpness baseline
+
 var LS_KEYS = { provider:"vqs_provider", model_gemini:"vqs_model_gemini", model_openai:"vqs_model_openai",
                 key_gemini:"vqs_key_gemini", key_openai:"vqs_key_openai" };
 var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4" };
@@ -158,13 +170,15 @@ function storeDel(k){ delete memStore[k]; try { localStorage.removeItem(k); } ca
 var $ = function(id){ return document.getElementById(id); };
 var video = $("cam"), bbox = $("bbox"), dot = $("dot"), statusText = $("statusText"),
     diffMeter = $("diffMeter"), logBox = $("log"), toast = $("answerToast"),
-    sampleCanvas = $("sampleCanvas"), sctx = sampleCanvas.getContext("2d", { willReadFrequently:true });
+    sampleCanvas = $("sampleCanvas"), sctx = sampleCanvas.getContext("2d", { willReadFrequently:true }),
+    sharpCanvas = $("sharpCanvas"), shctx = sharpCanvas.getContext("2d", { willReadFrequently:true });
 
 var state = "idle";            // idle | monitoring | settling | solving | speaking | cooldown
-var stream = null, prevGray = null;
+var stream = null, prevGrid = null, refGrid = null, lastGrid = null;
 var monitorTimer = null, settleTimer = null, busyTimer = null;
-var settleSince = 0, settleStart = 0;
-var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0;
+var settleSince = 0, settleStart = 0, blurLogged = false;
+var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, hotTileStreak = 0;
+var sharpHist = [];
 
 function setStatus(text, mode){
   statusText.textContent = text;
@@ -215,52 +229,127 @@ function unlockSpeech(){
   } catch (e) {}
 }
 
-/* ---------- change detection ---------- */
+/* ---------- change detection ----------
+   A pixel counts as "changed" when its gray level moves by more than PIXEL_THR.
+   New-question detection compares against refGrid (the last answered question's
+   frame), so a text-only change registers even when the phone never moves.
+   Stillness compares consecutive frames; small hand jitter stays under the
+   per-pixel threshold, so it no longer resets the wait. */
+function changedFrac(a, b){
+  var changed = 0;
+  for (var i = 0; i < a.length; i++){
+    if (Math.abs(a[i] - b[i]) > PIXEL_THR) changed++;
+  }
+  return changed / a.length;
+}
+// The hottest 10x10-cell tile: catches meaningful sparse edits (a changed word,
+// number, operator or answer option) that a whole-frame average dilutes to nothing.
+function tileFrac(a, b){
+  var tiles = new Uint16Array(TILE_W * TILE_H);
+  for (var y = 0; y < CMP_H; y++){
+    for (var x = 0; x < CMP_W; x++){
+      if (Math.abs(a[y * CMP_W + x] - b[y * CMP_W + x]) > PIXEL_THR){
+        tiles[((y / 10) | 0) * TILE_W + ((x / 10) | 0)]++;
+      }
+    }
+  }
+  var maxTile = 0;
+  for (var t = 0; t < tiles.length; t++){
+    var f = tiles[t] / 100;
+    if (f > maxTile) maxTile = f;
+  }
+  return maxTile;
+}
 function sample(){
   if (document.hidden || !video.videoWidth) return;
-  sctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
-  var data;
-  try { data = sctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data; }
+  sctx.drawImage(video, 0, 0, CMP_W, CMP_H);
+  shctx.drawImage(video, 0, 0, SH_W, SH_H);
+  var data, shdata;
+  try {
+    data = sctx.getImageData(0, 0, CMP_W, CMP_H).data;
+    shdata = shctx.getImageData(0, 0, SH_W, SH_H).data;
+  }
   catch (e) { return; }
-  var gray = new Float32Array(SAMPLE_W * SAMPLE_H);
+  var gray = new Float32Array(CMP_W * CMP_H);
   for (var i = 0, j = 0; i < data.length; i += 4, j++){
     gray[j] = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
   }
-  if (!prevGray){ prevGray = gray; return; }
-  var sum = 0;
-  for (var k = 0; k < gray.length; k++) sum += Math.abs(gray[k] - prevGray[k]);
-  var diff = sum / gray.length;
-  lastDiff = diff;
-  diffMeter.innerHTML = "&Delta; " + diff.toFixed(1);
-  prevGray = gray;
+  var sharpSum = 0, sharpCount = 0;
+  for (var y = 0; y < SH_H - 1; y++){
+    for (var x = 0; x < SH_W - 1; x++){
+      var p = (y * SH_W + x) * 4;
+      var g  = shdata[p]     * 0.299 + shdata[p+1] * 0.587 + shdata[p+2] * 0.114;
+      var gx = shdata[p+4]   * 0.299 + shdata[p+5] * 0.587 + shdata[p+6] * 0.114;
+      var q  = p + SH_W * 4;
+      var gy = shdata[q]     * 0.299 + shdata[q+1] * 0.587 + shdata[q+2] * 0.114;
+      var grad = Math.abs(g - gx) + Math.abs(g - gy);
+      if (grad > 8){ sharpSum += grad; sharpCount++; }   // edge-active pixels only, so fixed hard edges do not dominate
+    }
+  }
+  var sharp = sharpCount ? sharpSum / sharpCount : 0;
+  sharpHist.push(sharp);
+  if (sharpHist.length > SHARP_WINDOW) sharpHist.shift();
+  lastGrid = gray;
 
-  if ((state === "solving" || state === "speaking" || state === "cooldown") && diff > CHANGE_THRESHOLD){
-    interruptBusy();
-  } else if (state === "monitoring" && diff > CHANGE_THRESHOLD){
-    enterSettling();
-  } else if (state === "settling"){
-    if (diff < STABLE_THRESHOLD){
+  var fracRef = 0, tileRef = 0, fracPrev = 0;
+  if (refGrid){ fracRef = changedFrac(gray, refGrid); tileRef = tileFrac(gray, refGrid); }
+  if (prevGrid) fracPrev = changedFrac(gray, prevGrid);
+  prevGrid = gray;
+  lastDiff = fracRef;
+  lastTile = tileRef;
+  diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(1) + "%";
+
+  if (state === "solving" && refGrid && (fracRef > CHANGE_FRAC || tileRef > TILE_FRAC)){ interruptBusy(); return; }
+  if (state === "speaking" && refGrid && fracRef > MAJOR_CHANGE_FRAC){ interruptBusy(); return; }
+  if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
+  if (state === "monitoring"){
+    // sparse edits are single-cell signals: require the same hot tile on two
+    // consecutive passes so one noisy frame cannot fire a solve
+    if (tileRef > TILE_FRAC){ hotTileStreak++; } else { hotTileStreak = 0; }
+    if (!refGrid || fracRef > CHANGE_FRAC || hotTileStreak >= 2) enterSettling();
+    return;
+  }
+  if (state === "settling"){
+    if (fracPrev < STABLE_FRAC){
       if (!settleSince) settleSince = performance.now();
       if (performance.now() - settleSince >= STABLE_NEEDED_MS){
-        stopSettle();
-        log("Scene stable, solving");
-        triggerSolve("auto");
-        return;
+        if (refGrid && fracRef < CHANGE_FRAC && tileRef < TILE_FRAC){
+          stopSettle();
+          log("Same question as before - not solving");
+          resumeMonitor(0);
+          return;
+        }
+        var sharpMax = 0;
+        for (var s = 0; s < sharpHist.length; s++) if (sharpHist[s] > sharpMax) sharpMax = sharpHist[s];
+        if (sharp >= SHARP_GATE * sharpMax){
+          stopSettle();
+          log("Scene stable and clear - solving");
+          triggerSolve("auto");
+          return;
+        }
+        if (!blurLogged){ blurLogged = true; log("Waiting for a clearer frame"); }
+        settleSince = performance.now();   // stay settled; re-check sharpness on the next pass
       }
     } else {
       settleSince = 0;
     }
     if (performance.now() - settleStart > SETTLE_TIMEOUT_MS){
-      log("Scene never stabilized; resuming watch");
       stopSettle();
-      resumeMonitor(0);
+      if (refGrid && fracRef < CHANGE_FRAC && tileRef < TILE_FRAC){
+        log("Scene settled back - not solving");
+        resumeMonitor(0);
+        return;
+      }
+      log("Still moving - capturing best effort");
+      triggerSolve("auto");
     }
   }
 }
 function enterSettling(){
   state = "settling";
-  setStatus("Change Detected...", "change");
+  setStatus("New question...", "change");
   settleSince = 0;
+  blurLogged = false;
   settleStart = performance.now();
   clearInterval(monitorTimer); monitorTimer = null;
   settleTimer = setInterval(sample, SETTLE_MS);
@@ -286,8 +375,8 @@ function resumeMonitor(delay, seq){
     if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }
     state = "monitoring";
     setStatus("Monitoring...", "monitoring");
-    // keep prevGray: it holds the last settled scene, so an unchanged question
-    // shows ~0 diff (no retrigger) while a scene that changed mid-solve retriggers
+    // refGrid still holds the last answered question: an unchanged scene shows ~0%
+    // change (no retrigger) while a new question registers immediately
     monitorTimer = setInterval(sample, MONITOR_MS);
   }, delay || 0);
 }
@@ -309,6 +398,7 @@ async function doSolve(){
   clearInterval(monitorTimer); monitorTimer = null;
   if (busyTimer){ clearInterval(busyTimer); }
   busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
+  refGrid = lastGrid || refGrid;                    // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
   var cfg = getConfig();
@@ -464,6 +554,7 @@ setStatus("Idle - tap Start Camera");
 window.__quizSolver = {
   get state(){ return state; },
   get lastDiff(){ return lastDiff; },
+  get lastTile(){ return lastTile; },
   solveNow: function(){ triggerSolve("manual"); }
 };
 </script>
