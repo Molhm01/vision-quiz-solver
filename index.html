@@ -176,9 +176,11 @@ var LS_KEYS = { provider:"vqs_provider", model_gemini:"vqs_model_gemini", model_
 var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4", groq:"qwen/qwen3.8-27b", openrouter:"google/gemma-4-31b-it:free" };
 // OpenAI-compatible providers: chat.completions endpoint + Bearer key
 var PROVIDER_API = {
-  openai:     { url:"https://api.openai.com/v1/chat/completions",        label:"OpenAI" },
-  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq" },
-  openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",     label:"OpenRouter" }
+  openai:     { url:"https://api.openai.com/v1/chat/completions",        label:"OpenAI",     caps:{ auto:4, manual:5 } },
+  // Groq free tier: each snapshot ~2,050 tokens against 8K tokens/min -> ~3 snapshots/min max
+  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",   label:"Groq",       caps:{ auto:2, manual:3 } },
+  // OpenRouter free: 20 req/min shared across all free models; keep image calls conservative
+  openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",     label:"OpenRouter", caps:{ auto:2, manual:3 } }
 };
 
 var memStore = {};
@@ -628,7 +630,8 @@ function triggerSolve(source){
   if (source === "auto" && autoPaused){ resumeMonitor(0); return; }
   // Request pacing: provider free tier allows 5 requests/minute. Every attempt counts,
   // including failed and aborted ones; the queue holds only the latest question.
-  var cap = source === "manual" ? RPM_CAP_MANUAL : RPM_CAP_AUTO;
+  var pvCaps = (PROVIDER_API[getConfig().provider] || {}).caps || { auto: RPM_CAP_AUTO, manual: RPM_CAP_MANUAL };
+  var cap = source === "manual" ? pvCaps.manual : pvCaps.auto;
   var inWindow = paceRemaining();
   if (inWindow >= cap){
     var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
@@ -647,7 +650,7 @@ function triggerSolve(source){
       }, 1000);
     } else {
       setStatus("Rate limit - retry in ~" + Math.ceil(waitMs / 1000) + "s", "error");
-      log("Manual capture blocked: " + inWindow + " requests in the last 60s (limit 5)");
+      log("Manual capture blocked: " + inWindow + " requests in the last 60s (limit " + pvCaps.manual + " for this provider)");
     }
     return;
   }
@@ -830,8 +833,9 @@ function fillSettings(){
       + "defaults to its current replacement; edit the field to use any model your key can access. "
       + "Get a key at aistudio.google.com/apikey; usage may incur charges depending on your account. "
       + '<a href="https://aistudio.google.com/usage" target="_blank" rel="noopener">Check API usage and quota</a>.',
-    groq: "<b>Default: qwen/qwen3.8-27b</b> (vision-capable). Groq's free tier allows about 30 requests/min "
-      + "and 1,000 requests/day with a free account - no Google quota issues. "
+    groq: "<b>Default: qwen/qwen3.8-27b</b> (vision-capable, free tier). Each snapshot counts as about 2,050 "
+      + "tokens against Groq's free 8K tokens/min and 200K tokens/day, so plan on roughly 3 snapshots per minute "
+      + "and about 90 per day (the 30/min and 1,000/day headlines are for text; images share the token budget). "
       + "Create a free key at console.groq.com/keys. "
       + '<a href="https://console.groq.com/settings/limits" target="_blank" rel="noopener">Check usage and limits</a>.',
     openrouter: "<b>Default: google/gemma-4-31b-it:free</b> (vision-capable, zero-price). OpenRouter's free tier "
