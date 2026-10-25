@@ -334,8 +334,9 @@ var lastCr = null, lastCb = null, lastDet = null, lastDetCr = null, lastDetCb = 
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
-var structStreak = 0, chromaStreak = 0, sparseStreak = 0, bigStreak = 0;
-var hotRing = [];   // last 5 samples of hot sparse-tile lists
+var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
+var hotRing = [];   // last 5 luma-dominant change masks vs the reference
+var editLatch = false;   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
 
@@ -521,7 +522,6 @@ function sample(){
       nonStructural = changedN > 0 && (chromaN / changedN) > 0.5;
       structuralBig = !nonStructural;
     }
-    sparseHot = sparseScan(det, detCr, detCb);
   }
   if (prevGrid) fracPrev = changedFrac(gray, prevGrid);
   prevGrid = gray;
@@ -540,35 +540,54 @@ function sample(){
   }
   structStreak = structural ? structStreak + 1 : 0;
   chromaStreak = chromatic ? chromaStreak + 1 : 0;
-  var sparseTiles = (refGrid && refDet) ? sparseScan(det, detCr, detCb) : [];
-  hotRing.push(sparseTiles);
-  if (hotRing.length > 5) hotRing.shift();
-  // same tile hot in >=3 of last 5 samples = a real localized edit; noise never holds a tile
-  var tileCounts = {};
-  for (var ri = 0; ri < hotRing.length; ri++)
-    for (var rj = 0; rj < hotRing[ri].length; rj++)
-      tileCounts[hotRing[ri][rj]] = (tileCounts[hotRing[ri][rj]] || 0) + 1;
-  var sparsePersist = false;
-  for (var tk in tileCounts) if (tileCounts[tk] >= 3){ sparsePersist = true; break; }
-  var manyHot = sparseTiles.length >= 5;   // widespread structural change (full question swap)
-  bigStreak = manyHot ? bigStreak + 1 : 0;
-  sparseHot = sparseTiles.length;
-  var structuralHold = structStreak >= 2 || sparsePersist;
+  // Cell-level persistence ring: a cell counts when its luma changed and the change is
+  // luma-dominant (ink, not color feedback). A tile is persist-hot when >=SPARSE_MIN of
+  // its cells changed in >=3 of the last 5 samples. Measured on the noisy mock: camera
+  // noise NEVER produces one (0/23 samples), a one-word edit does (up to 3 tiles).
+  if (refGrid && refDet){
+    var mask = new Uint8Array(DET_W * DET_H);
+    for (var mp = 0; mp < DET_W * DET_H; mp++){
+      var mdl = Math.abs(det[mp] - refDet[mp]);
+      if (mdl > PIXEL_THR && Math.abs(detCr[mp] - refDetCr[mp]) + Math.abs(detCb[mp] - refDetCb[mp]) <= mdl) mask[mp] = 1;
+    }
+    hotRing.push(mask);
+    if (hotRing.length > 5) hotRing.shift();
+    if (hotRing.length >= 3 && !editLatch){
+      var cellCnt = new Uint8Array(DET_W * DET_H);
+      for (var ri = 0; ri < hotRing.length; ri++){
+        var rm = hotRing[ri];
+        for (var rp = 0; rp < rm.length; rp++) cellCnt[rp] += rm[rp];
+      }
+      var need = Math.min(3, hotRing.length);
+      var tilesP = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
+      for (var py = 0; py < DET_H; py++){
+        for (var px = 0; px < DET_W; px++){
+          var pp = py * DET_W + px;
+          if (cellCnt[pp] >= need) tilesP[((py / DET_TILE) | 0) * (DET_W / DET_TILE) + ((px / DET_TILE) | 0)]++;
+        }
+      }
+      var persistHot = 0;
+      for (var pt = 0; pt < tilesP.length; pt++) if (tilesP[pt] >= SPARSE_MIN) persistHot++;
+      if (persistHot >= 1) editLatch = true;   // latched: stays until the reference changes
+    }
+  }
+  sparseHot = editLatch ? 1 : 0;
+  var structuralHold = structStreak >= 2;
   var chromaHold = chromaStreak >= 2 && !structural;
   lastDiff = fracRef;
   lastTile = sparseHot;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(2) + "%";
 
-  if ((state === "solving" || state === "speaking") && refGrid && (sparsePersist || bigStreak >= 2)){ interruptBusy(); return; }
+  if ((state === "solving" || state === "speaking") && refGrid && editLatch){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
-    if (structuralHold || chromaHold || bigStreak >= 2){ enterSettling(); return; }
+    if (structuralHold || chromaHold || editLatch){ enterSettling(); return; }
     return;
   }
   if (state === "settling"){
     var elapsed = performance.now() - settleStart;
-    var realCandidate = sparsePersist || bigStreak >= 2;
+    var realCandidate = editLatch;
     // Pure color feedback (answer highlight): adopt as the new reference, no solve.
     if (refGrid && chromaHold && !realCandidate){
       stopSettle();
@@ -613,7 +632,7 @@ function adoptReference(){
   refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
   refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
   refEdgeDil = dilate(edgeMap(lastDet));
-  hotRing = []; structStreak = 0; chromaStreak = 0; bigStreak = 0;   // ring entries were measured vs the old reference
+  hotRing = []; editLatch = false; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
   state = "settling";
@@ -672,7 +691,7 @@ async function doSolve(){
     refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
     refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
     refEdgeDil = dilate(edgeMap(lastDet));
-    hotRing = []; structStreak = 0; chromaStreak = 0; bigStreak = 0;
+    hotRing = []; editLatch = false; structStreak = 0; chromaStreak = 0;
   }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
