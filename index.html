@@ -830,7 +830,9 @@ async function askModel(cfg, dataUrl, signal){
    which exactly one distinct standalone letter appears (an unambiguous echo).
    Reject everything else: conflicting declarations, trailing second-guessing,
    multiple candidate letters without a declaration, no letter at all. A rejected
-   reply is logged and NOT spoken - a wrong recitation is worse than none. */
+   reply is logged and NOT spoken - a wrong recitation is worse than none.
+   Accepted: a bare letter ("B") or explicit affirmative declarations that all agree
+   ("The answer is B"). Rejected: negation/uncertainty, letters in prose, conflicts. */
 function parseAnswer(raw){
   var clean = (raw || "").replace(/<think>[\s\S]*?<\/think>/gi, " ").trim();
   if (!clean) return { letter: null, reason: "empty reply" };
@@ -856,9 +858,10 @@ function parseAnswer(raw){
     var up = toks[k].toUpperCase();
     if (distinct.indexOf(up) < 0) distinct.push(up);
   }
-  if (distinct.length === 1) return { letter: distinct[0], how: "unambiguous-echo" };
+  // A lone letter inside prose is NOT accepted: "A is wrong" / "cannot determine whether B is correct"
+  // must never be spoken. Only a bare-letter reply or an explicit affirmative declaration above counts.
   if (!distinct.length) return { letter: null, reason: "no answer letter in reply" };
-  return { letter: null, reason: "multiple candidate letters without a declared answer (" + distinct.join(", ") + ")" };
+  return { letter: null, reason: "no declared answer (letters in prose are not trusted: " + distinct.join(", ") + ")" };
 }
 
 /* ---------- speech ---------- */
