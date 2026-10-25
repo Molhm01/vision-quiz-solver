@@ -1096,23 +1096,17 @@ window.__quizSolver = {
 
 </script>
 <script>
-// ===== DRIVER v7: THE dedup question - one text question + ticker, solved once, HELD 100s =====
+// ===== DRIVER v8: sparse one-word edit AFTER an answer, ticker running, queue must fire on same screen =====
 (function(){
   var m = window.__mock;
   function at(ms, fn){ setTimeout(fn, ms); }
-  m.fetchDelay = 3500;
-  m.speakDelay = 2500;
+  m.fetchDelay = 3500; m.speakDelay = 2500;
   at(50,  function(){ localStorage.setItem("vqs_provider","groq"); localStorage.setItem("vqs_key_groq","gsk_mock_key"); localStorage.removeItem("vqs_pace_v1"); });
-  at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); m.ev("start-t1"); });
-  // T1 solves ~5s, speech ends ~10s. Then ticker ONLY for 90s: NO second fetch allowed.
-  at(40000, function(){ m.jitter = 5; m.ev("jitter-on"); });    // moving phone 40-55s
-  at(55000, function(){ m.jitter = 0; m.ev("jitter-off"); });
-  // G (100s): truncated reply path: Q2 bars + truncate -> fetch ~105s, no speech, truncation logged
-  at(100000, function(){ m.truncate = true; m.textMode = false; m.scene = "Q2"; m.ev("truncate-scene"); });
-  at(120000, function(){
+  at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); });
+  at(15000, function(){ m.scene = "T3"; m.ev("t3-sparse-edit"); });   // one option word changed; ticker keeps ticking
+  at(80000, function(){
     window.__testResult = {
-      spoken: m.spoken, fetches: m.fetches, aborted: m.aborted, events: m.events,
-      dbg: (window.__dbg || []),
+      spoken: m.spoken, fetches: m.fetches, aborted: m.aborted,
       logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent.slice(0,140); })
     };
   });
