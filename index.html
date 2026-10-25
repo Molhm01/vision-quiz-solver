@@ -204,7 +204,7 @@ var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, re
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
-var autoPaused = false, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
+var autoPaused = false, dailyQuota = false, dailyProvider = null, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
 var reqTimes = [];            // every API attempt (auto, manual, failed, aborted) in the last 60s
 try {   // survive page refresh so a reload cannot bypass the provider rate window
   reqTimes = (JSON.parse(localStorage.getItem("vqs_pace_v1") || "[]") || []).filter(function(t){ return Date.now() - t < 60000; });
@@ -531,7 +531,7 @@ function sample(){
     var clear = sharp >= SHARP_GATE * sharpMax;
     if (fracPrev < stableThr && clear && elapsed >= SETTLE_MIN_MS && (realCandidate || !refGrid)){
       stopSettle();
-      log("Scene stable and clear - solving");
+      if (!pendingAuto) log("Scene stable and clear - solving");   // once per episode; the pacing queue already announced itself
       triggerSolve("auto");
       return;
     }
@@ -575,7 +575,9 @@ function enterSettling(){
   if (autoPaused){
     if (performance.now() - lastPausedLog > 10000){
       lastPausedLog = performance.now();
-      log("New question detected - automatic capture paused, tap Capture Now to retry");
+      log(dailyQuota && getConfig().provider === dailyProvider
+        ? "New question detected - auto capture paused (daily free limit reached - switch provider in Settings or try again tomorrow)"
+        : "New question detected - automatic capture paused, tap Capture Now to retry");
     }
     resumeMonitor(0);
     return;
@@ -632,7 +634,11 @@ function paceFire(){
   else { log("Queued question no longer detected - request skipped"); }
 }
 function triggerSolve(source){
-  if (source === "manual"){ autoPaused = false; consecFails = 0; }
+  if (source === "manual"){ autoPaused = false; consecFails = 0;
+    if (dailyQuota && getConfig().provider === dailyProvider){
+      log("Note: this provider's daily free limit was reported exhausted - this attempt may fail again (switch provider in Settings if so)");
+    }
+  }
   if (source === "auto" && autoPaused){ resumeMonitor(0); return; }
   // Request pacing: provider free tier allows 5 requests/minute. Every attempt counts,
   // including failed and aborted ones; the queue holds only the latest question.
@@ -642,7 +648,7 @@ function triggerSolve(source){
   if (inWindow >= cap){
     var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
     if (source === "auto"){
-      if (!pendingAuto){ log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s"); }   // once per queue episode, not per retrigger
+      if (!pendingAuto){ log("App pacing: queued to stay under this provider's free limit - sending in ~" + Math.ceil(waitMs / 1000) + "s (app-side pacing, not a provider error)"); }   // once per queue episode, not per retrigger
       pendingAuto = true;
       stopSettle();
       resumeMonitor(0);
@@ -652,11 +658,11 @@ function triggerSolve(source){
       var t0 = Date.now();
       paceTicker = setInterval(function(){
         var left = Math.max(0, Math.ceil((waitMs - (Date.now() - t0)) / 1000));
-        if (state === "monitoring") setStatus("Question queued - sending in ~" + left + "s (rate limit)", "change");
+        if (state === "monitoring") setStatus("Question queued - sending in ~" + left + "s (app pacing)", "change");
       }, 1000);
     } else {
-      setStatus("Rate limit - retry in ~" + Math.ceil(waitMs / 1000) + "s", "error");
-      log("Manual capture blocked: " + inWindow + " requests in the last 60s (limit " + pvCaps.manual + " for this provider)");
+      setStatus("App pacing - ready in ~" + Math.ceil(waitMs / 1000) + "s", "change");
+      log("App pacing: " + inWindow + " captures in the last 60s (app limit " + pvCaps.manual + "/min protects the free quota) - ready in ~" + Math.ceil(waitMs / 1000) + "s. This is app-side pacing, not a provider error.");
     }
     return;
   }
@@ -703,6 +709,7 @@ async function doSolve(){
       return;
     }
     consecFails = 0;
+    dailyQuota = false; dailyProvider = null;
     speakAnswer(m[0].toUpperCase(), mySeq);
   } catch (e) {
     if (e && e.name === "AbortError") return;
@@ -712,12 +719,22 @@ async function doSolve(){
     if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // request finished: stop the scene-change watchdog
     consecFails++;
     var quota = /429|quota|RESOURCE_EXHAUSTED/i.test(raw);
+    var daily = quota && /per[_ -]?day|\bRPD\b|daily/i.test(raw);
     if (quota || consecFails >= 2){
       // Circuit breaker: zero automatic calls until the user taps Capture Now.
       autoPaused = true;
-      monitorStatus = quota ? "API quota limit - auto capture paused" : "API failing - auto capture paused";
       monitorClass = "error";
-      log("Automatic capture paused - check usage/billing, then tap Capture Now to retry");
+      if (daily){
+        dailyQuota = true; dailyProvider = cfg.provider;
+        monitorStatus = "Daily free limit reached - switch provider in Settings or try again tomorrow";
+        log("Daily quota exhausted for this provider - more attempts today will keep failing. Switch provider in Settings or try again tomorrow.");
+      } else if (quota){
+        monitorStatus = "Provider per-minute limit - auto capture paused";
+        log("Provider per-minute limit hit - it resets within about a minute. Tap Capture Now to retry.");
+      } else {
+        monitorStatus = "API failing - auto capture paused";
+        log("Automatic capture paused - tap Capture Now to retry");
+      }
     } else {
       monitorStatus = "API error - see log"; monitorClass = "error";
     }
@@ -870,6 +887,7 @@ window.__quizSolver = {
   get lastTile(){ return lastTile; },
   solveNow: function(){ triggerSolve("manual"); }
 };
+
 </script>
 </body>
 </html>
