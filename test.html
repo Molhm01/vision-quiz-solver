@@ -336,7 +336,8 @@ var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
-var editLatch = false, latchStreak = 0, lastRingPush = 0;   // a persistent localized edit was observed vs the current reference
+var editLatch = false, latchStreak = 0, lastRingPush = 0;
+var detHist = [];   // last 5 detail grids; the reference is their per-cell median (phase-averaged, so autofocus hunting cancels)   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
 
@@ -504,6 +505,8 @@ function sample(){
   sharpHist.push(sharp);
   if (sharpHist.length > SHARP_WINDOW) sharpHist.shift();
   lastGrid = gray; lastCr = crr; lastCb = cbb; lastDet = det; lastDetCr = detCr; lastDetCb = detCb;
+  detHist.push({ g: det, cr: detCr, cb: detCb });
+  if (detHist.length > 5) detHist.shift();
 
   var fracRef = 0, fracPrev = 0, bigChange = false, structuralBig = false, nonStructural = false, sparseHot = 0;
   if (refGrid){
@@ -662,10 +665,25 @@ function sample(){
     }
   }
 }
+function medianGrid(key){
+  var n = detHist.length, out = new Float32Array(DET_W * DET_H);
+  var buf = [];
+  for (var p = 0; p < DET_W * DET_H; p++){
+    buf.length = 0;
+    for (var h = 0; h < n; h++) buf.push(detHist[h][key][p]);
+    buf.sort(function(a, b){ return a - b; });
+    out[p] = buf[n >> 1];
+  }
+  return out;
+}
 function adoptReference(){
   refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
-  refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
-  refEdgeDil = dilate(edgeMap(lastDet));
+  if (detHist.length >= 3){
+    refDet = medianGrid("g"); refDetCr = medianGrid("cr"); refDetCb = medianGrid("cb");
+  } else {
+    refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
+  }
+  refEdgeDil = dilate(edgeMap(refDet));
   hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
@@ -721,12 +739,7 @@ async function doSolve(){
   clearInterval(monitorTimer); monitorTimer = null;
   if (busyTimer){ clearInterval(busyTimer); }
   busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
-  if (lastGrid){
-    refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
-    refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
-    refEdgeDil = dilate(edgeMap(lastDet));
-    hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;
-  }  // the scene being solved becomes the reference
+  if (lastGrid){ adoptReference(); }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
   var cfg = getConfig();
