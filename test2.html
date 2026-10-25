@@ -900,19 +900,17 @@ async function doSolve(){
       resumeMonitor(3000);
       return;
     }
-    var clean = (result.text || "").replace(/<think>[\s\S]*?<\/think>/gi, " ");
-    var toks = clean.match(/\b[A-Ea-e]\b/g) || [];
-    if (!toks.length){
-      log("Unparsed reply: " + (result.text || "").slice(0, 60));
-      monitorStatus = "No answer parsed"; monitorClass = "error";
+    var parsed = parseAnswer(result.text);
+    if (!parsed.letter){
+      log("No confident answer (" + parsed.reason + "): " + (result.text || "").slice(0, 80));
+      monitorStatus = "No confident answer - see log"; monitorClass = "error";
       setStatus(monitorStatus, monitorClass);
       resumeMonitor(2500);
       return;
     }
-    if (toks.length > 1) log("Reply contained several letters (" + toks.join(", ") + ") - using the last one");
     consecFails = 0;
     dailyQuota = false; dailyProvider = null;
-    speakAnswer(toks[toks.length - 1].toUpperCase(), mySeq);
+    speakAnswer(parsed.letter, mySeq);
   } catch (e) {
     if (e && e.name === "AbortError") return;
     var raw = (e && e.message ? String(e.message) : String(e));
@@ -989,6 +987,43 @@ async function askModel(cfg, dataUrl, signal){
     return { text: ((ch0.message || {}).content || "").trim(),
              truncated: ch0.finish_reason === "length" };
   }
+}
+
+/* Strict answer parsing: speak only a confident letter.
+   Accept: a bare letter ("B", "b."), or an explicitly declared final answer
+   ("the answer is B", "Answer: B") that no later text contradicts, or prose in
+   which exactly one distinct standalone letter appears (an unambiguous echo).
+   Reject everything else: conflicting declarations, trailing second-guessing,
+   multiple candidate letters without a declaration, no letter at all. A rejected
+   reply is logged and NOT spoken - a wrong recitation is worse than none. */
+function parseAnswer(raw){
+  var clean = (raw || "").replace(/<think>[\s\S]*?<\/think>/gi, " ").trim();
+  if (!clean) return { letter: null, reason: "empty reply" };
+  var bare = clean.match(/^([A-Ea-e])\s*[.!)]?\s*$/);
+  if (bare) return { letter: bare[1].toUpperCase(), how: "bare" };
+  var declRe = /(?:answer|correct option|correct choice|correct answer)\s*(?:is|:|-)?\s*\(?\s*([A-Ea-e])\b/gi;
+  var decls = [], dm, lastDeclEnd = -1;
+  while ((dm = declRe.exec(clean)) !== null){ decls.push(dm[1].toUpperCase()); lastDeclEnd = declRe.lastIndex; }
+  if (decls.length){
+    var d0 = decls[0];
+    for (var i = 1; i < decls.length; i++){
+      if (decls[i] !== d0) return { letter: null, reason: "conflicting declared answers (" + decls.join(" vs ") + ")" };
+    }
+    var trailing = clean.slice(lastDeclEnd).match(/\b[A-Ea-e]\b/g) || [];
+    for (var t2 = 0; t2 < trailing.length; t2++){
+      if (trailing[t2].toUpperCase() !== d0) return { letter: null, reason: "second-guessing after the declared answer (" + d0 + " then " + trailing[t2].toUpperCase() + ")" };
+    }
+    return { letter: d0, how: "declared" };
+  }
+  var toks = clean.match(/\b[A-Ea-e]\b/g) || [];
+  var distinct = [];
+  for (var k = 0; k < toks.length; k++){
+    var up = toks[k].toUpperCase();
+    if (distinct.indexOf(up) < 0) distinct.push(up);
+  }
+  if (distinct.length === 1) return { letter: distinct[0], how: "unambiguous-echo" };
+  if (!distinct.length) return { letter: null, reason: "no answer letter in reply" };
+  return { letter: null, reason: "multiple candidate letters without a declared answer (" + distinct.join(", ") + ")" };
 }
 
 /* ---------- speech ---------- */
@@ -1091,23 +1126,46 @@ window.__quizSolver = {
   get state(){ return state; },
   get lastDiff(){ return lastDiff; },
   get lastTile(){ return lastTile; },
-  solveNow: function(){ triggerSolve("manual"); }
+  solveNow: function(){ triggerSolve("manual"); },
+  parseAnswer: parseAnswer
 };
 
 </script>
 <script>
-// ===== DRIVER v8: sparse one-word edit AFTER an answer, ticker running, queue must fire on same screen =====
+// ===== DRIVER v9: strict parser unit matrix + one integration rejection =====
 (function(){
   var m = window.__mock;
   function at(ms, fn){ setTimeout(fn, ms); }
   m.fetchDelay = 3500; m.speakDelay = 2500;
-  at(50,  function(){ localStorage.setItem("vqs_provider","groq"); localStorage.setItem("vqs_key_groq","gsk_mock_key"); localStorage.removeItem("vqs_pace_v1"); });
-  at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); });
-  at(15000, function(){ m.scene = "T3"; m.ev("t3-sparse-edit"); });   // one option word changed; ticker keeps ticking
-  at(80000, function(){
+  at(50, function(){ localStorage.setItem("vqs_provider","groq"); localStorage.setItem("vqs_key_groq","gsk_mock_key"); localStorage.removeItem("vqs_pace_v1"); });
+  at(400, function(){
+    var p = window.__quizSolver.parseAnswer;
+    var cases = [
+      ["B", "B"], ["b.", "B"], ["Answer: B", "B"],
+      ["The answer is B.", "B"],
+      ["B) Paris", "B"],
+      ["<think>A seems plausible but C is wrong</think>B", "B"],
+      ["<think>reasoning</think> The answer is C.", "C"],
+      ["Let me check. A) Madrid is in Spain. C) Rome is Italy. The answer is B.", "B"],
+      ["The answer is A. Actually the answer is B.", null],
+      ["The answer is B. Or maybe C.", null],
+      ["A) Madrid, B) Paris, C) Rome - hard to say", null],
+      ["", null], ["<think>only reasoning</think>", null],
+      ["I cannot read the image", null],
+      ["B. Wait no, the answer is C.", "C"]
+    ];
+    window.__parseResults = cases.map(function(c){
+      var r = p(c[0]);
+      return { in: c[0].slice(0, 40), want: c[1], got: r.letter, how: r.how || r.reason, pass: r.letter === c[1] };
+    });
+  });
+  // integration: conflicting declarations through the full fetch path -> no speech
+  at(600, function(){ m.textMode = true; m.scene = "T1"; m.replyText = "The answer is A. Actually the answer is B."; document.getElementById("btnStart").click(); });
+  at(15000, function(){
     window.__testResult = {
-      spoken: m.spoken, fetches: m.fetches, aborted: m.aborted,
-      logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent.slice(0,140); })
+      parse: window.__parseResults,
+      spoken: m.spoken, fetches: m.fetches,
+      logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent.slice(0,150); })
     };
   });
 })();
