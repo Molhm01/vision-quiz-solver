@@ -780,10 +780,10 @@ function triggerSolve(source){
   if (inWindow >= cap){
     var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
     if (source === "auto"){
+      if (!pendingAuto){ log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s"); }   // once per queue episode, not per retrigger
       pendingAuto = true;
       stopSettle();
       resumeMonitor(0);
-      log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s");
       if (paceTimer) clearTimeout(paceTimer);
       paceTimer = setTimeout(paceFire, waitMs);
       if (paceTicker) clearInterval(paceTicker);
