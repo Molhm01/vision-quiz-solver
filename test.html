@@ -336,7 +336,7 @@ var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
-var editLatch = false, latchStreak = 0;   // a persistent localized edit was observed vs the current reference
+var editLatch = false, latchStreak = 0, lastRingPush = 0;   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
 
@@ -516,7 +516,7 @@ function sample(){
         var dl = Math.abs(gray[k] - refGrid[k]);
         if (dl > PIXEL_THR){
           changedN++;
-          if (Math.abs(crr[k] - refCr[k]) + Math.abs(cbb[k] - refCb[k]) > dl) chromaN++;
+          if (Math.abs(crr[k] - refCr[k]) + Math.abs(cbb[k] - refCb[k]) > 0.4 * dl) chromaN++;
         }
       }
       nonStructural = changedN > 0 && (chromaN / changedN) > 0.5;
@@ -540,7 +540,7 @@ function sample(){
   }
   structStreak = structural ? structStreak + 1 : 0;
   chromaStreak = chromatic ? chromaStreak + 1 : 0;
-  var persistHotNow = 0, persistHot5 = 0;
+  var persistHotNow = 0, persistHot5 = 0, maskTotNow = 0;
   // Cell-level persistence ring: a cell counts when its luma changed and the change is
   // luma-dominant (ink, not color feedback). A tile is persist-hot when >=SPARSE_MIN of
   // its cells changed in >=3 of the last 5 samples. Measured on the noisy mock: camera
@@ -557,17 +557,22 @@ function sample(){
           for (var mx2 = 1; mx2 < DET_W - 1; mx2++){
             var mp = my2 * DET_W + mx2, rp = ry * DET_W + (mx2 + sx);
             var mdl = Math.abs(det[mp] - refDet[rp]);
-            if (mdl > PIXEL_THR && Math.abs(detCr[mp] - refDetCr[rp]) + Math.abs(detCb[mp] - refDetCb[rp]) <= mdl){ m2[mp] = 1; cnt2++; }
+            if (mdl > PIXEL_THR && Math.abs(detCr[mp] - refDetCr[rp]) + Math.abs(detCb[mp] - refDetCb[rp]) <= 0.4 * mdl){ m2[mp] = 1; cnt2++; }
           }
         }
         if (cnt2 < bestCount){ bestCount = cnt2; bestMask = m2; }
       }
     }
     var mask = bestMask;
-    hotRing.push(mask);
-    if (hotRing.length > 5) hotRing.shift();
+    maskTotNow = bestCount;   // aligned changed-cell total this sample (noise measured <=27, full swap 100+)
+    var nowMs = performance.now();
+    if (nowMs - lastRingPush >= 350){   // span the focus-hunt oscillation: 5 entries >= ~1.4s
+      hotRing.push(mask);
+      if (hotRing.length > 5) hotRing.shift();
+      lastRingPush = nowMs;
+    }
     var persistHot = 0;
-    if (hotRing.length >= 3){
+    if (hotRing.length >= 5){   // full ring: spans >=1.4s regardless of sample cadence
       var cellCnt = new Uint8Array(DET_W * DET_H);
       for (var ri = 0; ri < hotRing.length; ri++){
         var rm = hotRing[ri];
@@ -614,7 +619,9 @@ function sample(){
   }
   if (state === "settling"){
     var elapsed = performance.now() - settleStart;
-    var realCandidate = editLatch;
+    var bigFast = false;
+    if (refGrid && fracRef > refThr) bigFast = maskTotNow >= 45;   // widespread aligned change, far above noise (<=27 measured)
+    var realCandidate = editLatch || bigFast;
     // Pure color feedback (answer highlight): adopt as the new reference, no solve.
     if (refGrid && chromaHold && !realCandidate){
       stopSettle();
@@ -659,7 +666,7 @@ function adoptReference(){
   refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
   refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
   refEdgeDil = dilate(edgeMap(lastDet));
-  hotRing = []; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
+  hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
   state = "settling";
@@ -718,7 +725,7 @@ async function doSolve(){
     refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
     refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
     refEdgeDil = dilate(edgeMap(lastDet));
-    hotRing = []; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;
+    hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;
   }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
@@ -891,20 +898,20 @@ window.__quizSolver = {
   function ev(s){ m.ev(s + " @" + Math.round(performance.now() - T0)); }
   at(100,   function(){ document.getElementById("btnStart").click(); });
   // A: static bars Q1 under camera noise -> solve "Answer B" once (~2-5s)
-  // B (7-10.5s): extra hand jitter on Q1 -> no fetch
-  at(7000,  function(){ m.jitter = 4; ev("jitter-on"); });
-  at(10500, function(){ m.jitter = 0; ev("jitter-off"); });
-  // C (11s): small-text T1 -> solve "Answer D"
+  // B (11s): small-text T1 -> solve "Answer D"
   at(11000, function(){ m.textMode = true; m.scene = "T1"; ev("t1"); });
+  // B2 (16.5-19.5s): extra hand jitter ON THE TEXT SCREEN -> no fetch, no dup
+  at(16500, function(){ m.jitter = 4; ev("jitter-on"); });
+  at(19500, function(){ m.jitter = 0; ev("jitter-off"); });
   // D (18s): green answer-highlight T1H -> NO solve; adopt + feedback log
-  at(18000, function(){ m.scene = "T1H"; ev("t1-highlight"); });
+  at(21000, function(){ m.scene = "T1H"; ev("t1-highlight"); });
   // E (23s): highlight reverts -> adopt, no solve
-  at(23000, function(){ m.scene = "T1"; ev("t1-revert"); });
+  at(26000, function(){ m.scene = "T1"; ev("t1-revert"); });
   // F (27s): full small-text swap T2 -> solve "Answer A"
-  at(27000, function(){ m.scene = "T2"; ev("t2"); });
+  at(30000, function(){ m.scene = "T2"; ev("t2"); });
   // G (34s): one-word sparse edit T3 -> MUST solve "Answer A" via sparse path
-  at(34000, function(){ m.scene = "T3"; ev("t3-oneword"); });
-  at(42000, function(){
+  at(37000, function(){ m.scene = "T3"; ev("t3-oneword"); });
+  at(46000, function(){
     window.__testResult = {
       spoken: m.spoken, fetches: m.fetches, aborted: m.aborted, events: m.events,
       logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent; })
