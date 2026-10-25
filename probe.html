@@ -651,33 +651,35 @@ window.__quizSolver = {
     }
     return o;
   }
+  var ring = [];   // last 5 luma-dominant change masks (Uint8Array DET cells)
   function measure(){
     if (!ref) return;
     var cur = grids();
-    var curE = edgeMap(cur.g);
-    var nT = (DET_W/DET_TILE)*(DET_H/DET_TILE);
-    var t32 = new Uint16Array(nT), t70 = new Uint16Array(nT), tNE = new Uint16Array(nT),
-        tNED = new Uint16Array(nT), tFF = new Uint16Array(nT), tVF = new Uint16Array(nT);
-    var tot32 = 0;
-    for (var y = 0; y < DET_H; y++) for (var x = 0; x < DET_W; x++){
-      var p = y*DET_W + x;
+    var mask = new Uint8Array(DET_W*DET_H);
+    for (var p = 0; p < DET_W*DET_H; p++){
       var dl = Math.abs(cur.g[p] - ref[p]);
-      var ti = ((y/DET_TILE)|0)*(DET_W/DET_TILE) + ((x/DET_TILE)|0);
-      if (dl > PIXEL_THR){ t32[ti]++; tot32++; }
-      if (dl > 70) t70[ti]++;
-      if (curE[p] && !refEdge[p]) tNE[ti]++;
-      if (curE[p] && !refEdgeDil[p]) tNED[ti]++;
-      if (!refEdgeDil[p] && dl > PIXEL_THR && (Math.abs(cur.cr[p]-refCr[p]) + Math.abs(cur.cb[p]-refCb[p]) <= dl)) tFF[ti]++;
-      if (!refEdge[p] && dl > 70 && (Math.abs(cur.cr[p]-refCr[p]) + Math.abs(cur.cb[p]-refCb[p]) <= dl)) tVF[ti]++;
+      if (dl > PIXEL_THR && (Math.abs(cur.cr[p]-refCr[p]) + Math.abs(cur.cb[p]-refCb[p]) <= dl)) mask[p] = 1;
     }
-    function hot(a, min){ var h = 0; for (var i = 0; i < a.length; i++) if (a[i] >= min) h++; return h; }
-    function maxc(a){ var mx = 0; for (var i = 0; i < a.length; i++) if (a[i] > mx) mx = a[i]; return mx; }
+    ring.push(mask);
+    if (ring.length > 5) ring.shift();
+    // per-cell count over ring
+    var cnt = new Uint8Array(DET_W*DET_H);
+    for (var r2 = 0; r2 < ring.length; r2++) for (var p2 = 0; p2 < DET_W*DET_H; p2++) cnt[p2] += ring[r2][p2];
+    var nT = (DET_W/DET_TILE)*(DET_H/DET_TILE);
+    var t5of5 = new Uint16Array(nT), t4of5 = new Uint16Array(nT), t3of5 = new Uint16Array(nT), tot = 0;
+    for (var y = 0; y < DET_H; y++) for (var x = 0; x < DET_W; x++){
+      var p3 = y*DET_W + x;
+      if (!mask[p3]) continue;
+      tot++;
+      var ti = ((y/DET_TILE)|0)*(DET_W/DET_TILE) + ((x/DET_TILE)|0);
+      if (cnt[p3] >= 5) t5of5[ti]++;
+      if (cnt[p3] >= 4) t4of5[ti]++;
+      if (cnt[p3] >= 3) t3of5[ti]++;
+    }
+    function hot(a, min){ var h = 0, mx = 0; for (var i = 0; i < a.length; i++){ if (a[i] >= min) h++; if (a[i] > mx) mx = a[i]; } return [h, mx]; }
     out[phase].push({
-      tot32: tot32,
-      hot32_3: hot(t32,3), hot70_3: hot(t70,3),
-      hotNE_3: hot(tNE,3), hotNED_3: hot(tNED,3), hotNED_2: hot(tNED,2),
-      hotFF_3: hot(tFF,3), hotVF_2: hot(tVF,2), hotVF_3: hot(tVF,3),
-      max70: maxc(t70), maxFF: maxc(tFF), maxVF: maxc(tVF)
+      tot: tot, ringN: ring.length,
+      h55_3: hot(t5of5,3), h45_3: hot(t4of5,3), h45_4: hot(t4of5,4), h35_3: hot(t3of5,3), h35_4: hot(t3of5,4), h35_5: hot(t3of5,5)
     });
   }
   setTimeout(function(){
