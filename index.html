@@ -49,7 +49,9 @@
   button.danger { color:#ff8f9a; }
   #log { position:fixed; left:10px; right:10px; bottom:calc(env(safe-area-inset-bottom, 0px) + 66px);
     font:10px/1.5 monospace; color:var(--dim); background:rgba(8,11,15,.55); border-radius:8px;
-    padding:6px 8px; max-height:74px; overflow:hidden; z-index:15; }
+    padding:6px 8px; max-height:74px; overflow-y:auto; -webkit-overflow-scrolling:touch;
+    -webkit-user-select:text; user-select:text; z-index:15; }
+  #log.open { max-height:45vh; background:rgba(8,11,15,.92); }
   #sheet { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--panel);
     border-radius:18px 18px 0 0; padding:18px 18px calc(env(safe-area-inset-bottom, 0px) + 18px);
     transform:translateY(105%); transition:transform .25s ease; max-height:82%; overflow-y:auto;
@@ -212,8 +214,9 @@ function log(msg){
   var line = document.createElement("div");
   line.textContent = new Date().toLocaleTimeString() + "  " + msg;
   logBox.insertBefore(line, logBox.firstChild);
-  while (logBox.children.length > 6) logBox.removeChild(logBox.lastChild);
+  while (logBox.children.length > 30) logBox.removeChild(logBox.lastChild);   // keep enough history that a 429 body stays readable in the expanded log
 }
+logBox.addEventListener("click", function(){ logBox.classList.toggle("open"); });   // tap the log to read/copy long errors
 
 function getConfig(){
   var provider = storeGet(LS_KEYS.provider) || "gemini";
@@ -477,7 +480,7 @@ function sample(){
   // Mid-solve interruption is reserved for a widespread persistent change (a full new
   // question). A sparse edit mid-solve is not interrupted: the stale answer may speak,
   // then monitoring detects the edit and solves the new question right after.
-  if ((state === "solving" || state === "speaking") && refGrid && hotRing.length >= 5 && persistHot5 >= 4){ interruptBusy(); return; }
+  if ((state === "solving" || state === "speaking") && !autoPaused && refGrid && hotRing.length >= 5 && persistHot5 >= 4){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
@@ -620,10 +623,10 @@ function triggerSolve(source){
   if (inWindow >= cap){
     var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
     if (source === "auto"){
+      if (!pendingAuto){ log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s"); }   // once per queue episode, not per retrigger
       pendingAuto = true;
       stopSettle();
       resumeMonitor(0);
-      log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s");
       if (paceTimer) clearTimeout(paceTimer);
       paceTimer = setTimeout(paceFire, waitMs);
       if (paceTicker) clearInterval(paceTicker);
@@ -665,6 +668,7 @@ async function doSolve(){
   if (!cfg.key){
     setStatus("Add an API key in Settings", "error");
     log("No API key saved");
+    if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }
     resumeMonitor(2500);
     return;
   }
@@ -687,6 +691,7 @@ async function doSolve(){
     var raw = (e && e.message ? String(e.message) : String(e));
     raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
     log("API error: " + raw);
+    if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // request finished: stop the scene-change watchdog
     consecFails++;
     var quota = /429|quota|RESOURCE_EXHAUSTED/i.test(raw);
     if (quota || consecFails >= 2){
