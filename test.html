@@ -329,8 +329,8 @@ var video = $("cam"), bbox = $("bbox"), dot = $("dot"), statusText = $("statusTe
 
 var state = "idle";            // idle | monitoring | settling | solving | speaking | cooldown
 var stream = null, prevGrid = null, refGrid = null, lastGrid = null;
-var refCr = null, refCb = null, refDet = null, refEdgeDil = null;
-var lastCr = null, lastCb = null, lastDet = null, curEdgeMap = null;
+var refCr = null, refCb = null, refDet = null, refDetCr = null, refDetCb = null, refEdgeDil = null;
+var lastCr = null, lastCb = null, lastDet = null, lastDetCr = null, lastDetCb = null;
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
@@ -430,20 +430,28 @@ function dilate(e){
   return d;
 }
 // Per-tile counts of (a) changed cells away from old edges and (b) newly appeared edges.
-function sparseScan(det, refDet, refEdgeDil){
+// A sparse edit (one word/number/operator swapped at the same spot) barely moves the
+// whole-frame numbers, but it DOES flip cells that were flat in the reference: new ink
+// lands on background cells and old ink vanishes from stroke-interior cells. Focus
+// hunting and jitter only move pixels near existing edges (covered by refEdgeDil), and
+// pure color feedback is chroma-dominant - so "luma-dominant change on a ref-flat cell"
+// is unique to real text edits.
+function sparseScan(det, detCr, detCb){
   var tilesC = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
-  var tilesE = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
   var hot = 0;
   for (var y = 0; y < DET_H; y++){
     for (var x = 0; x < DET_W; x++){
       var p = y * DET_W + x;
+      if (refEdgeDil[p]) continue;
+      var dl = Math.abs(det[p] - refDet[p]);
+      if (dl <= PIXEL_THR) continue;
+      if (Math.abs(detCr[p] - refDetCr[p]) + Math.abs(detCb[p] - refDetCb[p]) > dl) continue;  // chroma feedback, not ink
       var ti = ((y / DET_TILE) | 0) * (DET_W / DET_TILE) + ((x / DET_TILE) | 0);
-      if (!refEdgeDil[p] && Math.abs(det[p] - refDet[p]) > PIXEL_THR) tilesC[ti]++;
-      if (curEdgeMap[p] && !refEdgeDil[p]) tilesE[ti]++;
+      tilesC[ti]++;
     }
   }
   for (var t = 0; t < tilesC.length; t++){
-    if (tilesC[t] >= SPARSE_MIN && tilesE[t] >= SPARSE_MIN) hot++;
+    if (tilesC[t] >= SPARSE_MIN) hot++;
   }
   return hot;
 }
@@ -475,8 +483,12 @@ function sample(){
     cbb[j] = data[i+2] - data[i+1];
   }
   var det = new Float32Array(DET_W * DET_H);
+  var detCr = new Float32Array(DET_W * DET_H);
+  var detCb = new Float32Array(DET_W * DET_H);
   for (var i2 = 0, j2 = 0; i2 < detData.length; i2 += 4, j2++){
     det[j2] = detData[i2] * 0.299 + detData[i2+1] * 0.587 + detData[i2+2] * 0.114;
+    detCr[j2] = detData[i2] - detData[i2+1];
+    detCb[j2] = detData[i2+2] - detData[i2+1];
   }
   var sharpSum = 0, sharpCount = 0;
   for (var y = 0; y < SH_H - 1; y++){
@@ -493,8 +505,7 @@ function sample(){
   var sharp = sharpCount ? sharpSum / sharpCount : 0;
   sharpHist.push(sharp);
   if (sharpHist.length > SHARP_WINDOW) sharpHist.shift();
-  lastGrid = gray; lastCr = crr; lastCb = cbb; lastDet = det;
-  curEdgeMap = edgeMap(det);
+  lastGrid = gray; lastCr = crr; lastCb = cbb; lastDet = det; lastDetCr = detCr; lastDetCb = detCb;
 
   var fracRef = 0, fracPrev = 0, bigChange = false, structuralBig = false, nonStructural = false, sparseHot = 0;
   if (refGrid){
@@ -513,7 +524,7 @@ function sample(){
       nonStructural = changedN > 0 && (chromaN / changedN) > 0.5;
       structuralBig = !nonStructural;
     }
-    sparseHot = sparseScan(det, refDet, refEdgeDil);
+    sparseHot = sparseScan(det, detCr, detCb);
   }
   if (prevGrid) fracPrev = changedFrac(gray, prevGrid);
   prevGrid = gray;
@@ -583,7 +594,8 @@ function sample(){
   }
 }
 function adoptReference(){
-  refGrid = lastGrid; refCr = lastCr; refCb = lastCb; refDet = lastDet;
+  refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
+  refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
   refEdgeDil = dilate(edgeMap(lastDet));
 }
 function enterSettling(){
@@ -639,7 +651,7 @@ async function doSolve(){
   clearInterval(monitorTimer); monitorTimer = null;
   if (busyTimer){ clearInterval(busyTimer); }
   busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
-  if (lastGrid){ refGrid = lastGrid; refCr = lastCr; refCb = lastCb; refDet = lastDet; refEdgeDil = dilate(edgeMap(lastDet)); }  // the scene being solved becomes the reference
+  if (lastGrid){ refGrid = lastGrid; refCr = lastCr; refCb = lastCb; refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb; refEdgeDil = dilate(edgeMap(lastDet)); }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
   var cfg = getConfig();
