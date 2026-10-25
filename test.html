@@ -348,6 +348,11 @@ var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
 var autoPaused = false, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
+var reqTimes = [];            // every API attempt (auto, manual, failed, aborted) in the last 60s
+var RPM_CAP_AUTO = 4;         // provider free tier is 5 requests/min; auto keeps one slot spare for the user
+var RPM_CAP_MANUAL = 5;
+var pendingAuto = false, paceTimer = null, paceTicker = null; // single-slot queue: only the LATEST question is ever queued
+var lastRefThr = 0.0012;
 var detHist = [];   // last 5 detail grids; the reference is their per-cell median (phase-averaged, so autofocus hunting cancels)   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
@@ -546,6 +551,7 @@ function sample(){
   if (noiseHist.length > NOISE_WIN) noiseHist.shift();
   var noiseMed = median(noiseHist);
   var refThr = Math.max(REF_CHANGE_MIN, NOISE_MULT * noiseMed);
+  lastRefThr = refThr;
   var stableThr = Math.max(STABLE_MIN, (NOISE_MULT - 1) * noiseMed);
   // Persistence: a real question change holds across samples; a noise spike does not.
   var structural = false, chromatic = false;
@@ -742,9 +748,49 @@ function resumeMonitor(delay, seq){
 }
 
 /* ---------- solving ---------- */
+function paceRemaining(){
+  var now = Date.now();
+  reqTimes = reqTimes.filter(function(t){ return now - t < 60000; });
+  return reqTimes.length;
+}
+function paceFire(){
+  if (paceTimer){ clearTimeout(paceTimer); paceTimer = null; }
+  if (paceTicker){ clearInterval(paceTicker); paceTicker = null; }
+  if (!pendingAuto) return;
+  pendingAuto = false;
+  if (state !== "monitoring") return;
+  // re-validate that the queued question is still on screen before spending a request
+  if (!refGrid || editLatch || lastDiff > lastRefThr){ enterSettling(); }
+  else { log("Queued question no longer detected - request skipped"); }
+}
 function triggerSolve(source){
   if (source === "manual"){ autoPaused = false; consecFails = 0; }
   if (source === "auto" && autoPaused){ resumeMonitor(0); return; }
+  // Request pacing: provider free tier allows 5 requests/minute. Every attempt counts,
+  // including failed and aborted ones; the queue holds only the latest question.
+  var cap = source === "manual" ? RPM_CAP_MANUAL : RPM_CAP_AUTO;
+  var inWindow = paceRemaining();
+  if (inWindow >= cap){
+    var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
+    if (source === "auto"){
+      pendingAuto = true;
+      stopSettle();
+      resumeMonitor(0);
+      log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s");
+      if (paceTimer) clearTimeout(paceTimer);
+      paceTimer = setTimeout(paceFire, waitMs);
+      if (paceTicker) clearInterval(paceTicker);
+      var t0 = Date.now();
+      paceTicker = setInterval(function(){
+        var left = Math.max(0, Math.ceil((waitMs - (Date.now() - t0)) / 1000));
+        if (state === "monitoring") setStatus("Question queued - sending in ~" + left + "s (rate limit)", "change");
+      }, 1000);
+    } else {
+      setStatus("Rate limit - retry in ~" + Math.ceil(waitMs / 1000) + "s", "error");
+      log("Manual capture blocked: " + inWindow + " requests in the last 60s (limit 5)");
+    }
+    return;
+  }
   if (source === "auto" && Date.now() - lastSpokenAt < COOLDOWN_MS){
     log("Cooldown: duplicate trigger ignored");
     resumeMonitor(0);
@@ -753,6 +799,10 @@ function triggerSolve(source){
   doSolve();
 }
 async function doSolve(){
+  pendingAuto = false;
+  if (paceTimer){ clearTimeout(paceTimer); paceTimer = null; }
+  if (paceTicker){ clearInterval(paceTicker); paceTicker = null; }
+  reqTimes.push(Date.now());   // every attempt counts against the provider rate window
   var mySeq = ++reqSeq;
   if (aborter) aborter.abort();
   aborter = new AbortController();
