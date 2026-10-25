@@ -1062,17 +1062,14 @@ window.__quizSolver = {
   // A (3s): manual tap with per-DAY 429 -> daily wording + dailyQuota flag
   at(3000,  function(){ m.fail429 = true; document.getElementById("btnCapture").click(); });
   at(4500,  function(){ window.__s1 = document.getElementById("statusText").textContent; });
-  // B (5s): manual tap again while dailyQuota known -> warning log, then provider switch
-  at(5000,  function(){ document.getElementById("btnCapture").click(); });
-  at(6500,  function(){ window.__s1b = document.getElementById("statusText").textContent; });
-  // C (7s): switch provider to openrouter, per-MINUTE 429 -> per-minute wording
-  at(7000,  function(){ localStorage.setItem("vqs_provider","openrouter"); localStorage.setItem("vqs_key_openrouter","sk-or-mock");
+  // B (6s): switch provider to openrouter, per-MINUTE 429 -> per-minute wording (window: auto+tap1 = 2 < 3 manual cap)
+  at(6000,  function(){ localStorage.setItem("vqs_provider","openrouter"); localStorage.setItem("vqs_key_openrouter","sk-or-mock");
                         m.fail429msg = "Rate limit reached for model google/gemma-4-31b-it:free on tokens per minute (TPM): try again in 42s";
                         document.getElementById("btnCapture").click(); });
-  at(8500,  function(){ window.__s2 = document.getElementById("statusText").textContent; });
+  at(7500,  function(){ window.__s2 = document.getElementById("statusText").textContent; });
   at(10000, function(){
     window.__testResult = {
-      s1: window.__s1 || null, s1b: window.__s1b || null, s2: window.__s2 || null,
+      s1: window.__s1 || null, s2: window.__s2 || null,
       fetches: m.fetches,
       logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent; })
     };
