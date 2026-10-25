@@ -113,6 +113,14 @@
   <label for="inpModel">Model</label>
   <input id="inpModel" type="text" autocomplete="off">
   <p class="note" id="modelNote"></p>
+  <div id="allowBox" style="display:none">
+    <label for="inpAllow">Request allowance (paid provider opt-in)</label>
+    <input id="inpAllow" type="number" min="1" step="1" inputmode="numeric" placeholder="How many requests to allow, e.g. 20">
+    <div class="row">
+      <button id="btnAllow" class="primary">Allow this many requests</button>
+    </div>
+    <p class="note" id="allowNote"></p>
+  </div>
   <label>Prompt sent with each snapshot</label>
   <pre id="promptView"></pre>
   <p class="note"><b>Key storage:</b> your key is saved only in this browser's localStorage and is sent
@@ -187,6 +195,43 @@ var PROVIDER_API = {
 var memStore = {};
 function storeGet(k){ try { return localStorage.getItem(k); } catch (e){ return (k in memStore) ? memStore[k] : null; } }
 function storeSet(k, v){ memStore[k] = v; try { localStorage.setItem(k, v); } catch (e){} }
+/* Paid-provider request allowance (opt-in hard stop).
+   Providers that can cost money (OpenAI always; OpenRouter only with a non-":free"
+   model) send NOTHING until the user explicitly allows a finite number of requests.
+   The allowance is consumed BEFORE dispatch, so failed and aborted attempts count
+   too. It persists in localStorage across refresh and never resets on its own -
+   only the user setting a (higher) number lets more requests through. It limits
+   request count, not dollars; the billing backstop lives in the provider account. */
+function isPaidUse(provider, model){
+  // Scope: OpenAI only. Free-tier providers are NOT assumed free forever - a key can
+  // be attached to a billed account. This guard makes no protection claim for them.
+  return provider === "openai";
+}
+function allowanceKey(provider){ return "vqs_allowance_" + provider; }
+function allowanceGet(provider){
+  try {
+    var v = JSON.parse(storeGet(allowanceKey(provider)) || "null");
+    if (v && typeof v.total === "number" && typeof v.used === "number") return v;
+  } catch (e){}
+  return null;
+}
+function allowanceSet(provider, total){
+  var cur = allowanceGet(provider) || { total: 0, used: 0 };
+  cur.total = Math.max(0, Math.floor(total));
+  storeSet(allowanceKey(provider), JSON.stringify(cur));
+  return cur;
+}
+/* Returns null when a request may proceed (consuming one unit BEFORE dispatch);
+   otherwise returns the block reason. Consumed units are never refunded. */
+function allowanceConsume(provider, model){
+  if (!isPaidUse(provider, model)) return null;
+  var a = allowanceGet(provider);
+  if (!a || a.total <= 0) return "paid provider use is off - set a request allowance in Settings first";
+  if (a.used >= a.total) return "request allowance used up (" + a.used + " of " + a.total + ") - raise it in Settings to send more";
+  a.used += 1;
+  storeSet(allowanceKey(provider), JSON.stringify(a));
+  return null;
+}
 function storeDel(k){ delete memStore[k]; try { localStorage.removeItem(k); } catch (e){} }
 var $ = function(id){ return document.getElementById(id); };
 var video = $("cam"), bbox = $("bbox"), dot = $("dot"), statusText = $("statusText"),
@@ -722,6 +767,16 @@ async function doSolve(){
     resumeMonitor(2500);
     return;
   }
+  var gate = allowanceConsume(cfg.provider, cfg.model);
+  if (gate){
+    autoPaused = true;   // hard stop: automatic captures halt until the user raises the allowance
+    monitorStatus = "Paid provider blocked - see log"; monitorClass = "error";
+    setStatus(monitorStatus, monitorClass);
+    log("Request blocked before sending: " + gate + ". The allowance counts requests, not dollars.");
+    if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }
+    resumeMonitor(2500);
+    return;
+  }
   try {
     var dataUrl = captureJPEG();
     var result = await askModel(cfg, dataUrl, aborter.signal);
@@ -924,6 +979,16 @@ $("btnClearKey").addEventListener("click", function(){
   $("inpKey").value = "";
   log("API key deleted (" + p + ")");
 });
+$("btnAllow").addEventListener("click", function(){
+  var p = $("selProvider").value;
+  var n = parseInt($("inpAllow").value, 10);
+  if (!n || n < 1){ log("Enter how many requests to allow (a number of 1 or more)"); return; }
+  var a = allowanceSet(p, n);
+  autoPaused = false;   // user just acted; automatic capture may resume within the new allowance
+  log("Request allowance set for " + p + ": " + a.used + " of " + a.total + " used. Counts requests, not dollars.");
+  refreshAllowNote();
+});
+$("inpModel").addEventListener("input", refreshAllowNote);
 function fillSettings(){
   var provider = storeGet(LS_KEYS.provider) || "gemini";
   $("selProvider").value = provider;
@@ -938,15 +1003,35 @@ function fillSettings(){
     groq: "<b>Default: qwen/qwen3.8-27b</b> (vision-capable, free tier). Each snapshot counts as about 2,050 "
       + "tokens against Groq's free 8K tokens/min and 200K tokens/day, so plan on roughly 3 snapshots per minute "
       + "and about 90 per day (the 30/min and 1,000/day headlines are for text; images share the token budget). "
+      + "Free tier assumes a free account - if your Groq account has billing enabled, usage may incur charges. "
       + "Create a free key at console.groq.com/keys. "
       + '<a href="https://console.groq.com/settings/limits" target="_blank" rel="noopener">Check usage and limits</a>.',
     openrouter: "<b>Default: google/gemma-4-31b-it:free</b> (vision-capable, zero-price). OpenRouter's free tier "
-      + "allows about 20 requests/min and 50 requests/day. Create a free key at openrouter.ai/keys. "
+      + "allows about 20 requests/min and 50 requests/day with a :free model. Check the model’s price and your own account on openrouter.ai before relying on free use. Create a free key at openrouter.ai/keys. "
       + '<a href="https://openrouter.ai/activity" target="_blank" rel="noopener">Check usage</a>.',
     openai: "<b>Default: gpt-5.4</b> (vision-capable). Needs an API key from platform.openai.com; "
-      + "a ChatGPT subscription does not include API access, and API usage is billed separately per request."
+      + "a ChatGPT subscription does not include API access, and API usage is billed separately per request. "
+      + "<b>Paid use is opt-in here:</b> set a request allowance below before the app will send anything, "
+      + "and consider a monthly spend limit in your OpenAI project settings as a billing backstop."
   };
   $("modelNote").innerHTML = NOTES[provider] || NOTES.gemini;
+  refreshAllowNote();
+}
+function refreshAllowNote(){
+  var p = $("selProvider").value;
+  var m = ($("inpModel").value.trim() || DEFAULT_MODEL[p]);
+  if (!isPaidUse(p, m)){ $("allowBox").style.display = "none"; return; }
+  $("allowBox").style.display = "";
+  var a = allowanceGet(p);
+  var rules = " Failed attempts count too. The allowance limits request count, not dollars - set a spending limit in your provider account for a billing backstop.";
+  if (a && a.total > 0){
+    $("allowNote").innerHTML = "<b>" + a.used + " of " + a.total
+      + " allowed requests used.</b> When it runs out the app stops sending (automatic and manual) until you raise the number."
+      + rules;
+  } else {
+    $("allowNote").innerHTML = "<b>Off: this provider can cost money, so the app sends nothing until you allow a number of requests above.</b>"
+      + rules;
+  }
 }
 function openSheet(){ fillSettings(); $("sheet").classList.add("open"); }
 
@@ -965,7 +1050,11 @@ window.__quizSolver = {
   get lastDiff(){ return lastDiff; },
   get lastTile(){ return lastTile; },
   solveNow: function(){ triggerSolve("manual"); },
-  parseAnswer: parseAnswer
+  parseAnswer: parseAnswer,
+  isPaidUse: isPaidUse,
+  allowanceGet: allowanceGet,
+  allowanceSet: allowanceSet,
+  allowanceConsume: allowanceConsume
 };
 
 </script>
