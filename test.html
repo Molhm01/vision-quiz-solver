@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Vision Quiz Solver</title>
+<style>
+  :root { --accent:#22e39a; --bg:#0b0f14; --panel:#131a22; --text:#e8eef2; --dim:#8b98a5; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; padding:0; height:100%; background:#000; color:var(--text);
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    touch-action:manipulation; overscroll-behavior:none; }
+  #cam { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+  #bbox { position:fixed; left:10%; top:22%; width:80%; height:42%;
+    border:2px dashed rgba(34,227,154,.85); border-radius:14px; pointer-events:none;
+    transition:opacity .2s; }
+  #bbox.hidden { opacity:0; }
+  #bboxTag { position:absolute; top:-24px; left:0; font-size:11px; color:var(--accent);
+    background:rgba(8,11,15,.7); padding:2px 8px; border-radius:6px; white-space:nowrap; }
+  #topbar { position:fixed; top:calc(env(safe-area-inset-top, 0px) + 10px); left:10px; right:10px;
+    display:flex; align-items:center; gap:8px; }
+  #statusPill { display:flex; align-items:center; gap:8px; padding:8px 14px; border-radius:999px;
+    background:rgba(10,14,18,.72); backdrop-filter:blur(8px); font-size:14px; font-weight:600;
+    border:1px solid rgba(255,255,255,.08); }
+  .dot { width:9px; height:9px; border-radius:50%; background:#5b6773; }
+  .dot.monitoring { background:var(--accent); box-shadow:0 0 8px var(--accent); }
+  .dot.change { background:#ffcc4d; box-shadow:0 0 8px #ffcc4d; }
+  .dot.solving { background:#5aa9ff; box-shadow:0 0 8px #5aa9ff; }
+  .dot.speaking { background:#c58bff; box-shadow:0 0 8px #c58bff; }
+  .dot.error { background:#ff5a6a; box-shadow:0 0 8px #ff5a6a; }
+  #diffMeter { margin-left:auto; font:11px/1 monospace; color:var(--dim);
+    background:rgba(10,14,18,.6); padding:6px 8px; border-radius:8px; }
+  #banner { position:fixed; top:calc(env(safe-area-inset-top, 0px) + 54px); left:10px; right:10px;
+    background:rgba(120,20,28,.92); color:#ffd9dd; font-size:12px; padding:10px 12px;
+    border-radius:10px; display:none; z-index:30; }
+  #answerToast { position:fixed; left:50%; top:38%; transform:translate(-50%,-50%) scale(.8);
+    font-size:120px; font-weight:800; color:var(--accent); text-shadow:0 4px 30px rgba(0,0,0,.8);
+    opacity:0; pointer-events:none; transition:opacity .18s, transform .18s; z-index:25; }
+  #answerToast.show { opacity:1; transform:translate(-50%,-50%) scale(1); }
+  #controls { position:fixed; left:0; right:0; bottom:calc(env(safe-area-inset-bottom, 0px) + 12px);
+    display:flex; justify-content:center; gap:10px; padding:0 12px; z-index:20; }
+  button { border:1px solid rgba(255,255,255,.12); background:rgba(19,26,34,.85); color:var(--text);
+    padding:12px 16px; border-radius:12px; font-size:14px; font-weight:600; cursor:pointer;
+    backdrop-filter:blur(8px); }
+  button:active { transform:scale(.96); }
+  button.primary { background:var(--accent); color:#04281a; border:none; }
+  button.danger { color:#ff8f9a; }
+  #log { position:fixed; left:10px; right:10px; bottom:calc(env(safe-area-inset-bottom, 0px) + 66px);
+    font:10px/1.5 monospace; color:var(--dim); background:rgba(8,11,15,.55); border-radius:8px;
+    padding:6px 8px; max-height:74px; overflow:hidden; z-index:15; }
+  #sheet { position:fixed; left:0; right:0; bottom:0; z-index:40; background:var(--panel);
+    border-radius:18px 18px 0 0; padding:18px 18px calc(env(safe-area-inset-bottom, 0px) + 18px);
+    transform:translateY(105%); transition:transform .25s ease; max-height:82%; overflow-y:auto;
+    box-shadow:0 -10px 40px rgba(0,0,0,.6); }
+  #sheet.open { transform:translateY(0); }
+  #sheet h3 { margin:0 0 12px; font-size:16px; }
+  #sheet label { display:block; font-size:12px; color:var(--dim); margin:12px 0 4px; }
+  #sheet input, #sheet select { width:100%; padding:12px; border-radius:10px; font-size:15px;
+    background:#0d141b; color:var(--text); border:1px solid rgba(255,255,255,.1); }
+  #sheet .row { display:flex; gap:8px; margin-top:6px; }
+  #sheet .row button { flex:1; }
+  #sheet .row.sticky { position:sticky; bottom:0; background:var(--panel); padding-top:8px; }
+  #sheet pre { white-space:pre-wrap; font:10px/1.5 monospace; color:var(--dim);
+    background:#0d141b; padding:10px; border-radius:8px; }
+  #sheet p.note { font-size:11.5px; color:var(--dim); line-height:1.55; margin:10px 0 0; }
+  #sheet p.note b { color:#ffcf87; font-weight:600; }
+  #startOverlay { position:fixed; inset:0; z-index:50; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:14px; text-align:center;
+    background:radial-gradient(120% 100% at 50% 0%, #12202b 0%, var(--bg) 60%); padding:28px; }
+  #startOverlay h1 { font-size:24px; margin:0; }
+  #startOverlay p.sub { color:var(--dim); font-size:13.5px; line-height:1.6; max-width:340px; margin:0; }
+  #btnStart { font-size:17px; padding:16px 34px; border-radius:14px; }
+  #startError { color:#ff8f9a; font-size:13px; min-height:18px; margin:0; }
+</style>
+</head>
+<body>
+<video id="cam" autoplay muted playsinline></video>
+<div id="bbox"><span id="bboxTag">Guide only - the full camera view is analyzed</span></div>
+
+<div id="topbar">
+  <div id="statusPill"><span class="dot" id="dot"></span><span id="statusText">Idle</span></div>
+  <span id="diffMeter">&Delta; --</span>
+</div>
+<div id="banner"></div>
+<div id="answerToast"></div>
+<div id="log"></div>
+
+<div id="controls">
+  <button id="btnBox">Box: On</button>
+  <button id="btnCapture" class="primary">Capture Now</button>
+  <button id="btnSettings">Settings</button>
+</div>
+
+<div id="sheet">
+  <h3>Settings</h3>
+  <label for="selProvider">AI provider</label>
+  <select id="selProvider">
+    <option value="gemini">Google Gemini</option>
+    <option value="openai">OpenAI</option>
+  </select>
+  <label for="inpKey">API key</label>
+  <input id="inpKey" type="password" autocomplete="off" placeholder="Paste your API key">
+  <div class="row">
+    <button id="btnSaveKey" class="primary">Save Key</button>
+    <button id="btnClearKey" class="danger">Clear Key</button>
+  </div>
+  <label for="inpModel">Model</label>
+  <input id="inpModel" type="text" autocomplete="off">
+  <p class="note" id="modelNote"></p>
+  <label>Prompt sent with each snapshot</label>
+  <pre id="promptView"></pre>
+  <p class="note"><b>Key storage:</b> your key is saved only in this browser's localStorage and is sent
+    only to the selected provider's API when solving. Anyone using this browser profile could read a
+    saved key, so use Clear Key on shared devices.</p>
+  <p class="note"><b>Privacy:</b> camera frames stay on this device. A snapshot leaves the phone only
+    when sent to the selected provider to answer a question. No analytics, no other network calls.</p>
+  <p class="note"><b>Hosting:</b> phone cameras require a secure page. Host this file over HTTPS
+    (GitHub Pages, Vercel) and open the https:// link.</p>
+  <div class="row sticky"><button id="btnCloseSheet">Done</button></div>
+</div>
+
+<div id="startOverlay">
+  <h1>Vision Quiz Solver</h1>
+  <p class="sub">Point the back camera at a test screen and leave it there. When a new question
+    appears and the picture is clear, the app reads it and speaks the answer out loud -
+    no buttons, no need to hold perfectly still.</p>
+  <p class="sub">1. Open Settings and paste an API key &nbsp; 2. Tap Start Camera &nbsp;
+    3. Align the screen inside the box</p>
+  <button id="btnStart" class="primary">Start Camera</button>
+  <p id="startError"></p>
+  <p class="sub" style="font-size:11px">The start tap is required once by the browser to allow the
+    camera and voice. Voice answers use your phone's built-in speech.</p>
+</div>
+
+<canvas id="sampleCanvas" width="48" height="36" style="display:none"></canvas>
+<canvas id="sharpCanvas" width="96" height="72" style="display:none"></canvas>
+
+<script>
+// ===== TEST HARNESS MOCK (only present in test.html) =====
+(function(){
+  var mock = window.__mock = {
+    scene: "Q1", jitter: 0, blur: 0,
+    spoken: [], fetches: [], aborted: 0,
+    fetchDelay: 2500,
+    answerMap: { Q1: "B", Q2: "C", Q3: "A" },
+    events: []
+  };
+  function ev(name){ mock.events.push({ t: Math.round(performance.now()), ev: name }); }
+  mock.ev = ev;
+
+  function mulberry(a){ return function(){ a|=0; a = a + 0x6D2B79F5 | 0; var t = Math.imul(a ^ a>>>15, 1|a); t = t + Math.imul(t ^ t>>>7, 61|t) ^ t; return ((t ^ t>>>14) >>> 0) / 4294967296; }; }
+
+  // fake camera: canvas stream drawing the current "quiz screen"
+  var cam = document.createElement("canvas");
+  cam.width = 1280; cam.height = 720;
+  var c = cam.getContext("2d");
+  function drawScene(){
+    c.save();
+    c.filter = mock.blur > 0 ? "blur(" + mock.blur + "px)" : "none";
+    var jx = mock.jitter ? (Math.random()*2-1)*mock.jitter : 0;
+    var jy = mock.jitter ? (Math.random()*2-1)*mock.jitter : 0;
+    c.translate(jx, jy);
+    // room + screen bezel: identical across scenes, overscanned so jitter shows no borders
+    c.fillStyle = "#101418"; c.fillRect(-40, -40, 1360, 800);
+    c.fillStyle = "#1c2530"; c.fillRect(100, 60, 1080, 600);
+    // scene "text lines": bright bars whose positions/lengths differ per scene
+    c.fillStyle = "#e8eef2";
+    var seed = mock.scene === "Q1" ? 1 : mock.scene === "Q2" ? 2 : 3;
+    var rnd = mulberry(seed * 99991);
+    for (var i = 0; i < 12; i++){
+      if (rnd() > 0.88) continue;             // some rows absent per scene
+      var w = 300 + rnd()*650, h = 20;
+      var x = 140 + rnd()*180, y = 110 + i*44;
+      c.fillRect(x, y, w, h);
+    }
+    c.restore();
+  }
+  setInterval(drawScene, 66);   // ~15 fps redraw so jitter/blur changes apply
+  drawScene();
+
+  navigator.mediaDevices = navigator.mediaDevices || {};
+  navigator.mediaDevices.getUserMedia = function(){
+    ev("getUserMedia");
+    return Promise.resolve(cam.captureStream(15));
+  };
+
+  // fake AI API with configurable latency and abort support
+  var realFetch = window.fetch.bind(window);
+  window.fetch = function(url, opts){
+    if (typeof url === "string" && (url.indexOf("generativelanguage") >= 0 || url.indexOf("openai") >= 0)){
+      var sceneAtStart = mock.scene;
+      mock.fetches.push({ t: Math.round(performance.now()), scene: sceneAtStart });
+      ev("fetch:" + sceneAtStart);
+      return new Promise(function(resolve, reject){
+        function body(letter){ return { candidates: [{ content: { parts: [{ text: letter }] } }] }; }
+        var timer = setTimeout(function(){
+          resolve(new Response(JSON.stringify(body(mock.answerMap[sceneAtStart])),
+            { status: 200, headers: { "Content-Type": "application/json" } }));
+        }, mock.fetchDelay);
+        var sig = opts && opts.signal;
+        if (sig) sig.addEventListener("abort", function(){
+          clearTimeout(timer);
+          mock.aborted++; ev("abort:" + sceneAtStart);
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+    }
+    return realFetch(url, opts);
+  };
+
+  // recording speech mock
+  try {
+    Object.defineProperty(window, "speechSynthesis", { configurable: true, value: {
+      speak: function(u){
+        if (u.volume === 0) return;   // silent unlock utterance
+        ev("speak:" + u.text);
+        mock.spoken.push(u.text);
+        setTimeout(function(){ if (u.onend) u.onend(); }, 700);
+      },
+      cancel: function(){ ev("speechCancel"); },
+      getVoices: function(){ return []; }
+    }});
+  } catch (e) { ev("speechMockFailed"); }
+
+  try { localStorage.setItem("vqs_key_gemini", "TEST-KEY-NOT-REAL"); } catch (e) {}
+})();
+</script>
+<script>
+"use strict";
+var PROMPT = "You are an automated multiple-choice quiz solver. Solve the question visible in the image. Return ONLY the letter of the correct answer (e.g., A, B, C, or D). Do not provide any explanation, markdown, or extra words.";
+
+var CMP_W = 48, CMP_H = 36;  // coarse comparison grid: text edits register, camera jitter averages out
+var SH_W = 96, SH_H = 72;    // finer grid for the sharpness (blur) estimate
+var MONITOR_MS = 400;         // frame sample cadence while watching
+var BUSY_WATCH_MS = 400;      // watchdog cadence while solving/speaking/cooldown
+var SETTLE_MS = 150;          // faster cadence while waiting for a stable, clear frame
+var PIXEL_THR = 32;           // per-pixel gray change (0-255) that counts a pixel as changed
+var CHANGE_FRAC = 0.025;      // changed-pixel fraction vs the answered scene that means new content
+var MAJOR_CHANGE_FRAC = 0.06; // larger change that also interrupts speech in progress
+var STABLE_FRAC = 0.01;       // changed-pixel fraction between consecutive frames that still counts as still
+var STABLE_NEEDED_MS = 450;   // scene must stay still this long before auto-capture
+var SETTLE_TIMEOUT_MS = 10000;// stop waiting for perfect stillness and capture best effort
+var COOLDOWN_MS = 2500;       // quiet period right after an answer is read
+var SHARP_GATE = 0.7;         // frame must reach this fraction of the recent best sharpness to auto-capture
+var SHARP_WINDOW = 24;        // samples kept for the rolling sharpness baseline
+
+var LS_KEYS = { provider:"vqs_provider", model_gemini:"vqs_model_gemini", model_openai:"vqs_model_openai",
+                key_gemini:"vqs_key_gemini", key_openai:"vqs_key_openai" };
+var DEFAULT_MODEL = { gemini:"gemini-3.6-flash", openai:"gpt-5.4" };
+
+var memStore = {};
+function storeGet(k){ try { return localStorage.getItem(k); } catch (e){ return (k in memStore) ? memStore[k] : null; } }
+function storeSet(k, v){ memStore[k] = v; try { localStorage.setItem(k, v); } catch (e){} }
+function storeDel(k){ delete memStore[k]; try { localStorage.removeItem(k); } catch (e){} }
+var $ = function(id){ return document.getElementById(id); };
+var video = $("cam"), bbox = $("bbox"), dot = $("dot"), statusText = $("statusText"),
+    diffMeter = $("diffMeter"), logBox = $("log"), toast = $("answerToast"),
+    sampleCanvas = $("sampleCanvas"), sctx = sampleCanvas.getContext("2d", { willReadFrequently:true }),
+    sharpCanvas = $("sharpCanvas"), shctx = sharpCanvas.getContext("2d", { willReadFrequently:true });
+
+var state = "idle";            // idle | monitoring | settling | solving | speaking | cooldown
+var stream = null, prevGrid = null, refGrid = null, lastGrid = null;
+var monitorTimer = null, settleTimer = null, busyTimer = null;
+var settleSince = 0, settleStart = 0, blurLogged = false;
+var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0;
+var sharpHist = [];
+
+function setStatus(text, mode){
+  statusText.textContent = text;
+  dot.className = "dot" + (mode ? " " + mode : "");
+}
+function log(msg){
+  var line = document.createElement("div");
+  line.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  logBox.insertBefore(line, logBox.firstChild);
+  while (logBox.children.length > 6) logBox.removeChild(logBox.lastChild);
+}
+
+function getConfig(){
+  var provider = storeGet(LS_KEYS.provider) || "gemini";
+  var model = storeGet(LS_KEYS["model_" + provider]) || DEFAULT_MODEL[provider];
+  var key = storeGet(LS_KEYS["key_" + provider]) || "";
+  return { provider: provider, model: model, key: key };
+}
+
+/* ---------- camera ---------- */
+async function startCamera(){
+  $("startError").textContent = "";
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    $("startError").textContent = "This browser has no camera API. Use HTTPS on a modern mobile browser.";
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+  } catch (e) {
+    $("startError").textContent = "Camera failed: " + e.message + " (needs HTTPS + permission).";
+    return;
+  }
+  video.srcObject = stream;
+  try { await video.play(); } catch (e) {}
+  unlockSpeech();
+  $("startOverlay").style.display = "none";
+  log("Camera started: " + (video.videoWidth || "?") + "x" + (video.videoHeight || "?"));
+  resumeMonitor(0);
+}
+function unlockSpeech(){
+  try {
+    var u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+/* ---------- change detection ----------
+   A pixel counts as "changed" when its gray level moves by more than PIXEL_THR.
+   New-question detection compares against refGrid (the last answered question's
+   frame), so a text-only change registers even when the phone never moves.
+   Stillness compares consecutive frames; small hand jitter stays under the
+   per-pixel threshold, so it no longer resets the wait. */
+function changedFrac(a, b){
+  var changed = 0;
+  for (var i = 0; i < a.length; i++){
+    if (Math.abs(a[i] - b[i]) > PIXEL_THR) changed++;
+  }
+  return changed / a.length;
+}
+function sample(){
+  if (document.hidden || !video.videoWidth) return;
+  sctx.drawImage(video, 0, 0, CMP_W, CMP_H);
+  shctx.drawImage(video, 0, 0, SH_W, SH_H);
+  var data, shdata;
+  try {
+    data = sctx.getImageData(0, 0, CMP_W, CMP_H).data;
+    shdata = shctx.getImageData(0, 0, SH_W, SH_H).data;
+  }
+  catch (e) { return; }
+  var gray = new Float32Array(CMP_W * CMP_H);
+  for (var i = 0, j = 0; i < data.length; i += 4, j++){
+    gray[j] = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
+  }
+  var sharpSum = 0, sharpCount = 0;
+  for (var y = 0; y < SH_H - 1; y++){
+    for (var x = 0; x < SH_W - 1; x++){
+      var p = (y * SH_W + x) * 4;
+      var g  = shdata[p]     * 0.299 + shdata[p+1] * 0.587 + shdata[p+2] * 0.114;
+      var gx = shdata[p+4]   * 0.299 + shdata[p+5] * 0.587 + shdata[p+6] * 0.114;
+      var q  = p + SH_W * 4;
+      var gy = shdata[q]     * 0.299 + shdata[q+1] * 0.587 + shdata[q+2] * 0.114;
+      sharpSum += Math.abs(g - gx) + Math.abs(g - gy);
+      sharpCount += 2;
+    }
+  }
+  var sharp = sharpSum / sharpCount;
+  sharpHist.push(sharp);
+  if (sharpHist.length > SHARP_WINDOW) sharpHist.shift();
+  lastGrid = gray;
+
+  var fracRef = refGrid ? changedFrac(gray, refGrid) : 0;
+  var fracPrev = prevGrid ? changedFrac(gray, prevGrid) : 0;
+  prevGrid = gray;
+  lastDiff = fracRef;
+  diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(1) + "%";
+
+  if (state === "solving" && refGrid && fracRef > CHANGE_FRAC){ interruptBusy(); return; }
+  if (state === "speaking" && refGrid && fracRef > MAJOR_CHANGE_FRAC){ interruptBusy(); return; }
+  if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
+  if (state === "monitoring"){
+    if (!refGrid || fracRef > CHANGE_FRAC) enterSettling();
+    return;
+  }
+  if (state === "settling"){
+    if (fracPrev < STABLE_FRAC){
+      if (!settleSince) settleSince = performance.now();
+      if (performance.now() - settleSince >= STABLE_NEEDED_MS){
+        if (refGrid && fracRef < CHANGE_FRAC){
+          stopSettle();
+          log("Same question as before - not solving");
+          resumeMonitor(0);
+          return;
+        }
+        var sharpMax = 0;
+        for (var s = 0; s < sharpHist.length; s++) if (sharpHist[s] > sharpMax) sharpMax = sharpHist[s];
+        if (sharp >= SHARP_GATE * sharpMax){
+          stopSettle();
+          log("Scene stable and clear - solving");
+          triggerSolve("auto");
+          return;
+        }
+        if (!blurLogged){ blurLogged = true; log("Waiting for a clearer frame"); }
+        settleSince = performance.now();   // stay settled; re-check sharpness on the next pass
+      }
+    } else {
+      settleSince = 0;
+    }
+    if (performance.now() - settleStart > SETTLE_TIMEOUT_MS){
+      stopSettle();
+      if (refGrid && fracRef < CHANGE_FRAC){
+        log("Scene settled back - not solving");
+        resumeMonitor(0);
+        return;
+      }
+      log("Still moving - capturing best effort");
+      triggerSolve("auto");
+    }
+  }
+}
+function enterSettling(){
+  state = "settling";
+  setStatus("New question...", "change");
+  settleSince = 0;
+  blurLogged = false;
+  settleStart = performance.now();
+  clearInterval(monitorTimer); monitorTimer = null;
+  settleTimer = setInterval(sample, SETTLE_MS);
+}
+function stopSettle(){
+  if (settleTimer){ clearInterval(settleTimer); settleTimer = null; }
+}
+function interruptBusy(){
+  log("Scene changed while busy - discarding stale result");
+  reqSeq++;                                  // invalidates in-flight request and speech callbacks
+  if (aborter){ aborter.abort(); }
+  try { window.speechSynthesis.cancel(); } catch (e) {}
+  toast.classList.remove("show");
+  lastSpokenAt = 0;                          // old answer discarded; the new question may solve now
+  if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }
+  enterSettling();
+}
+function resumeMonitor(delay, seq){
+  setTimeout(function(){
+    if (seq && seq !== reqSeq) return;   // a scene change superseded this scheduled resume
+    stopSettle();
+    clearInterval(monitorTimer);
+    if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }
+    state = "monitoring";
+    setStatus("Monitoring...", "monitoring");
+    // refGrid still holds the last answered question: an unchanged scene shows ~0%
+    // change (no retrigger) while a new question registers immediately
+    monitorTimer = setInterval(sample, MONITOR_MS);
+  }, delay || 0);
+}
+
+/* ---------- solving ---------- */
+function triggerSolve(source){
+  if (source === "auto" && Date.now() - lastSpokenAt < COOLDOWN_MS){
+    log("Cooldown: duplicate trigger ignored");
+    resumeMonitor(0);
+    return;
+  }
+  doSolve();
+}
+async function doSolve(){
+  var mySeq = ++reqSeq;
+  if (aborter) aborter.abort();
+  aborter = new AbortController();
+  stopSettle();
+  clearInterval(monitorTimer); monitorTimer = null;
+  if (busyTimer){ clearInterval(busyTimer); }
+  busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
+  refGrid = lastGrid || refGrid;                    // the scene being solved becomes the reference
+  state = "solving";
+  setStatus("Solving...", "solving");
+  var cfg = getConfig();
+  if (!cfg.key){
+    setStatus("Add an API key in Settings", "error");
+    log("No API key saved");
+    resumeMonitor(2500);
+    return;
+  }
+  try {
+    var dataUrl = captureJPEG();
+    var text = await askModel(cfg, dataUrl, aborter.signal);
+    if (mySeq !== reqSeq) return;   // a newer trigger superseded this request
+    var m = (text || "").trim().match(/[A-Ea-e]/);
+    if (!m){
+      log("Unparsed reply: " + (text || "").slice(0, 60));
+      setStatus("No answer parsed", "error");
+      resumeMonitor(2500);
+      return;
+    }
+    speakAnswer(m[0].toUpperCase(), mySeq);
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    log("API error: " + (e && e.message ? e.message : e));
+    setStatus("API error - see log", "error");
+    resumeMonitor(3000);
+  }
+}
+function captureJPEG(){
+  var c = document.createElement("canvas");
+  c.width = video.videoWidth;
+  c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  return c.toDataURL("image/jpeg", 0.85);
+}
+async function askModel(cfg, dataUrl, signal){
+  if (cfg.provider === "gemini"){
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+              encodeURIComponent(cfg.model) + ":generateContent";
+    var res = await fetch(url, {
+      method: "POST", signal: signal,
+      headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.key },
+      body: JSON.stringify({
+        contents: [{ parts: [ { text: PROMPT },
+          { inline_data: { mime_type: "image/jpeg", data: dataUrl.split(",")[1] } } ] }],
+        generationConfig: { temperature: 0 }
+      })
+    });
+    if (!res.ok) throw new Error("Gemini HTTP " + res.status + ": " + (await res.text()).slice(0, 160));
+    var j = await res.json();
+    var parts = (j.candidates && j.candidates[0] && j.candidates[0].content &&
+                 j.candidates[0].content.parts) || [];
+    return parts.map(function(p){ return p.text || ""; }).join("").trim();
+  } else {
+    var res2 = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST", signal: signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.key },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [{ role: "user", content: [ { type: "text", text: PROMPT },
+          { type: "image_url", image_url: { url: dataUrl } } ] }]
+      })
+    });
+    if (!res2.ok) throw new Error("OpenAI HTTP " + res2.status + ": " + (await res2.text()).slice(0, 160));
+    var j2 = await res2.json();
+    return (((j2.choices || [])[0] || {}).message || {}).content || "";
+  }
+}
+
+/* ---------- speech ---------- */
+function speakAnswer(letter, mySeq){
+  state = "speaking";
+  setStatus("Speaking...", "speaking");
+  lastSpokenAt = Date.now();
+  toast.textContent = letter;
+  toast.classList.add("show");
+  setTimeout(function(){ toast.classList.remove("show"); }, COOLDOWN_MS);
+  var done = false;
+  function finish(){
+    if (done) return;
+    done = true;
+    if (mySeq !== reqSeq) return;   // superseded by a scene change: stay silent, stay settled
+    state = "cooldown";
+    setStatus("Cooldown...", "");
+    var remain = COOLDOWN_MS - (Date.now() - lastSpokenAt);
+    setTimeout(function(){ resumeMonitor(0, mySeq); }, Math.max(remain, 0));
+  }
+  try {
+    var u = new SpeechSynthesisUtterance("Answer " + letter);
+    u.rate = 1; u.pitch = 1;
+    u.onend = finish; u.onerror = finish;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+    setTimeout(finish, 4000);   // fallback if onend never fires
+  } catch (e) { finish(); }
+}
+
+/* ---------- UI wiring ---------- */
+$("btnStart").addEventListener("click", startCamera);
+$("btnCapture").addEventListener("click", function(){
+  if (state === "idle"){ log("Start the camera first"); return; }
+  log("Manual capture");
+  triggerSolve("manual");
+});
+$("btnBox").addEventListener("click", function(){
+  var hidden = bbox.classList.toggle("hidden");
+  $("btnBox").textContent = hidden ? "Box: Off" : "Box: On";
+});
+$("btnSettings").addEventListener("click", function(){ openSheet(); });
+$("btnCloseSheet").addEventListener("click", function(){ $("sheet").classList.remove("open"); });
+$("selProvider").addEventListener("change", function(){
+  storeSet(LS_KEYS.provider, $("selProvider").value);
+  fillSettings();
+});
+$("btnSaveKey").addEventListener("click", function(){
+  var p = $("selProvider").value;
+  var v = $("inpKey").value.trim();
+  if (v){ storeSet(LS_KEYS["key_" + p], v); log("API key saved (" + p + ")"); }
+  storeSet(LS_KEYS["model_" + p], $("inpModel").value.trim() || DEFAULT_MODEL[p]);
+  $("sheet").classList.remove("open");
+});
+$("btnClearKey").addEventListener("click", function(){
+  var p = $("selProvider").value;
+  storeDel(LS_KEYS["key_" + p]);
+  $("inpKey").value = "";
+  log("API key deleted (" + p + ")");
+});
+function fillSettings(){
+  var provider = storeGet(LS_KEYS.provider) || "gemini";
+  $("selProvider").value = provider;
+  $("inpKey").value = storeGet(LS_KEYS["key_" + provider]) || "";
+  $("inpModel").value = storeGet(LS_KEYS["model_" + provider]) || DEFAULT_MODEL[provider];
+  $("modelNote").innerHTML = provider === "gemini"
+    ? "<b>Default: gemini-3.6-flash</b> (current stable model with image input). The Gemini 2.0 Flash "
+      + "from the original spec was shut down by Google on June 1, 2026, so this app defaults to its "
+      + "current replacement; edit the field to use any model your key can access. "
+      + "Get a key at aistudio.google.com/apikey; usage may incur charges depending on your account."
+    : "<b>Default: gpt-5.4</b> (vision-capable). Needs an API key from platform.openai.com; "
+      + "a ChatGPT subscription does not include API access, and API usage is billed separately per request.";
+}
+function openSheet(){ fillSettings(); $("sheet").classList.add("open"); }
+
+$("promptView").textContent = PROMPT;
+fillSettings();
+if (!window.isSecureContext){
+  var b = $("banner");
+  b.textContent = "This page is not on HTTPS, so the phone camera will not start. Host the file on GitHub Pages / Vercel and open the https:// link.";
+  b.style.display = "block";
+}
+setStatus("Idle - tap Start Camera");
+
+// minimal hooks for automated testing; harmless in normal use
+window.__quizSolver = {
+  get state(){ return state; },
+  get lastDiff(){ return lastDiff; },
+  solveNow: function(){ triggerSolve("manual"); }
+};
+</script>
+<script>
+// ===== TEST DRIVER (only present in test.html) =====
+(function(){
+  var m = window.__mock, qs = window.__quizSolver;
+  var T0 = performance.now();
+  function now(){ return Math.round(performance.now() - T0); }
+  function ev(s){ m.ev(s + " @" + now()); }
+  var lastState = null, stateLog = [];
+  var poller = setInterval(function(){
+    if (qs.state !== lastState){ stateLog.push({ t: now(), state: qs.state }); lastState = qs.state; }
+  }, 100);
+  function at(ms, fn){ setTimeout(fn, ms); }
+
+  // Phase A (0-7s): static Q1, phone perfectly still -> must auto-solve and speak "Answer B"
+  at(100,   function(){ ev("start-click"); document.getElementById("btnStart").click(); });
+  // Phase B (7-12s): same Q1 with handheld jitter +-4px -> must NOT solve again
+  at(7000,  function(){ ev("jitter-on"); m.jitter = 4; });
+  // Phase C (12s): Q2 appears but heavily blurred -> detect change, wait for clarity, no solve yet
+  at(12000, function(){ ev("q2-blurred"); m.jitter = 0; m.blur = 5; m.scene = "Q2"; });
+  // Phase C2 (15s): picture clears -> must auto-solve and speak "Answer C"
+  at(15000, function(){ ev("q2-clear"); m.blur = 0; });
+  // Phase D (18.5-22s): static Q2 -> no duplicate solve
+  // Phase E (22s): Q3 with a slower API; mid-request scene change back to Q1 at 24.5s
+  at(22000, function(){ m.fetchDelay = 3000; m.scene = "Q3"; ev("q3"); });
+  at(24500, function(){ m.scene = "Q1"; ev("q1-again-midflight"); });
+  // Expect: Q3 request aborted, stale answer discarded, only Q1 re-solved and spoken ("Answer B")
+  at(33000, function(){
+    clearInterval(poller);
+    var result = {
+      spoken: m.spoken,
+      fetches: m.fetches,
+      aborted: m.aborted,
+      events: m.events,
+      states: stateLog,
+      logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent; })
+    };
+    window.__testResult = result;
+    console.log("TEST_RESULT " + JSON.stringify(result));
+  });
+})();
+</script>
+</body>
+</html>
