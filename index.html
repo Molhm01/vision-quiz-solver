@@ -190,6 +190,16 @@ var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
+var autoPaused = false, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
+var reqTimes = [];            // every API attempt (auto, manual, failed, aborted) in the last 60s
+try {   // survive page refresh so a reload cannot bypass the provider rate window
+  reqTimes = (JSON.parse(localStorage.getItem("vqs_pace_v1") || "[]") || []).filter(function(t){ return Date.now() - t < 60000; });
+} catch (e) { reqTimes = []; }
+function savePace(){ try { localStorage.setItem("vqs_pace_v1", JSON.stringify(reqTimes.slice(-12))); } catch (e) {} }
+var RPM_CAP_AUTO = 4;         // provider free tier is 5 requests/min; auto keeps one slot spare for the user
+var RPM_CAP_MANUAL = 5;
+var pendingAuto = false, paceTimer = null, paceTicker = null; // single-slot queue: only the LATEST question is ever queued
+var lastRefThr = 0.0012;
 var detHist = [];   // last 5 detail grids; the reference is their per-cell median (phase-averaged, so autofocus hunting cancels)   // a persistent localized edit was observed vs the current reference
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
@@ -388,6 +398,7 @@ function sample(){
   if (noiseHist.length > NOISE_WIN) noiseHist.shift();
   var noiseMed = median(noiseHist);
   var refThr = Math.max(REF_CHANGE_MIN, NOISE_MULT * noiseMed);
+  lastRefThr = refThr;
   var stableThr = Math.max(STABLE_MIN, (NOISE_MULT - 1) * noiseMed);
   // Persistence: a real question change holds across samples; a noise spike does not.
   var structural = false, chromatic = false;
@@ -540,6 +551,14 @@ function adoptReference(){
   hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
+  if (autoPaused){
+    if (performance.now() - lastPausedLog > 10000){
+      lastPausedLog = performance.now();
+      log("New question detected - automatic capture paused, tap Capture Now to retry");
+    }
+    resumeMonitor(0);
+    return;
+  }
   state = "settling";
   setStatus("New question...", "change");
   monitorStatus = null; monitorClass = "";
@@ -554,7 +573,7 @@ function stopSettle(){
 function interruptBusy(){
   log("Scene changed while busy - discarding stale result");
   reqSeq++;                                  // invalidates in-flight request and speech callbacks
-  if (aborter){ aborter.abort(); }
+  if (aborter && state === "solving"){ aborter.abort(); }
   try { window.speechSynthesis.cancel(); } catch (e) {}
   toast.classList.remove("show");
   lastSpokenAt = 0;                          // old answer discarded; the new question may solve now
@@ -576,7 +595,49 @@ function resumeMonitor(delay, seq){
 }
 
 /* ---------- solving ---------- */
+function paceRemaining(){
+  var now = Date.now();
+  reqTimes = reqTimes.filter(function(t){ return now - t < 60000; });
+  return reqTimes.length;
+}
+function paceFire(){
+  if (paceTimer){ clearTimeout(paceTimer); paceTimer = null; }
+  if (paceTicker){ clearInterval(paceTicker); paceTicker = null; }
+  if (!pendingAuto) return;
+  pendingAuto = false;
+  if (state !== "monitoring") return;
+  // re-validate that the queued question is still on screen before spending a request
+  if (!refGrid || editLatch || lastDiff > lastRefThr){ enterSettling(); }
+  else { log("Queued question no longer detected - request skipped"); }
+}
 function triggerSolve(source){
+  if (source === "manual"){ autoPaused = false; consecFails = 0; }
+  if (source === "auto" && autoPaused){ resumeMonitor(0); return; }
+  // Request pacing: provider free tier allows 5 requests/minute. Every attempt counts,
+  // including failed and aborted ones; the queue holds only the latest question.
+  var cap = source === "manual" ? RPM_CAP_MANUAL : RPM_CAP_AUTO;
+  var inWindow = paceRemaining();
+  if (inWindow >= cap){
+    var waitMs = 60000 - (Date.now() - reqTimes[0]) + 500;
+    if (source === "auto"){
+      pendingAuto = true;
+      stopSettle();
+      resumeMonitor(0);
+      log("Rate limit pacing: request queued, sending in ~" + Math.ceil(waitMs / 1000) + "s");
+      if (paceTimer) clearTimeout(paceTimer);
+      paceTimer = setTimeout(paceFire, waitMs);
+      if (paceTicker) clearInterval(paceTicker);
+      var t0 = Date.now();
+      paceTicker = setInterval(function(){
+        var left = Math.max(0, Math.ceil((waitMs - (Date.now() - t0)) / 1000));
+        if (state === "monitoring") setStatus("Question queued - sending in ~" + left + "s (rate limit)", "change");
+      }, 1000);
+    } else {
+      setStatus("Rate limit - retry in ~" + Math.ceil(waitMs / 1000) + "s", "error");
+      log("Manual capture blocked: " + inWindow + " requests in the last 60s (limit 5)");
+    }
+    return;
+  }
   if (source === "auto" && Date.now() - lastSpokenAt < COOLDOWN_MS){
     log("Cooldown: duplicate trigger ignored");
     resumeMonitor(0);
@@ -585,8 +646,13 @@ function triggerSolve(source){
   doSolve();
 }
 async function doSolve(){
+  pendingAuto = false;
+  if (paceTimer){ clearTimeout(paceTimer); paceTimer = null; }
+  if (paceTicker){ clearInterval(paceTicker); paceTicker = null; }
+  reqTimes.push(Date.now());   // every attempt counts against the provider rate window
+  savePace();
   var mySeq = ++reqSeq;
-  if (aborter) aborter.abort();
+  if (aborter && state === "solving"){ aborter.abort(); }  // a prior request is still in flight
   aborter = new AbortController();
   stopSettle();
   clearInterval(monitorTimer); monitorTimer = null;
@@ -614,13 +680,27 @@ async function doSolve(){
       resumeMonitor(2500);
       return;
     }
+    consecFails = 0;
     speakAnswer(m[0].toUpperCase(), mySeq);
   } catch (e) {
     if (e && e.name === "AbortError") return;
-    log("API error: " + (e && e.message ? e.message : e));
-    monitorStatus = "API error - see log"; monitorClass = "error";
+    var raw = (e && e.message ? String(e.message) : String(e));
+    raw = raw.replace(/AIza[0-9A-Za-z_\-]{10,}/g, "[redacted-key]").replace(/(key=)[^&\s"']+/gi, "$1[redacted]");
+    log("API error: " + raw);
+    consecFails++;
+    var quota = /429|quota|RESOURCE_EXHAUSTED/i.test(raw);
+    if (quota || consecFails >= 2){
+      // Circuit breaker: zero automatic calls until the user taps Capture Now.
+      autoPaused = true;
+      monitorStatus = quota ? "API quota limit - auto capture paused" : "API failing - auto capture paused";
+      monitorClass = "error";
+      log("Automatic capture paused - check usage/billing, then tap Capture Now to retry");
+    } else {
+      monitorStatus = "API error - see log"; monitorClass = "error";
+    }
     setStatus(monitorStatus, monitorClass);
     resumeMonitor(3000);
+    return;
   }
 }
 function captureJPEG(){
@@ -643,7 +723,7 @@ async function askModel(cfg, dataUrl, signal){
         generationConfig: { temperature: 0 }
       })
     });
-    if (!res.ok) throw new Error("Gemini HTTP " + res.status + ": " + (await res.text()).slice(0, 160));
+    if (!res.ok) throw new Error("Gemini HTTP " + res.status + ": " + (await res.text()).slice(0, 600));
     var j = await res.json();
     var parts = (j.candidates && j.candidates[0] && j.candidates[0].content &&
                  j.candidates[0].content.parts) || [];
@@ -658,7 +738,7 @@ async function askModel(cfg, dataUrl, signal){
           { type: "image_url", image_url: { url: dataUrl } } ] }]
       })
     });
-    if (!res2.ok) throw new Error("OpenAI HTTP " + res2.status + ": " + (await res2.text()).slice(0, 160));
+    if (!res2.ok) throw new Error("OpenAI HTTP " + res2.status + ": " + (await res2.text()).slice(0, 600));
     var j2 = await res2.json();
     return (((j2.choices || [])[0] || {}).message || {}).content || "";
   }
@@ -729,10 +809,11 @@ function fillSettings(){
   $("inpKey").value = storeGet(LS_KEYS["key_" + provider]) || "";
   $("inpModel").value = storeGet(LS_KEYS["model_" + provider]) || DEFAULT_MODEL[provider];
   $("modelNote").innerHTML = provider === "gemini"
-    ? "<b>Default: gemini-3.6-flash</b> (current stable model with image input). The Gemini 2.0 Flash "
-      + "from the original spec was shut down by Google on June 1, 2026, so this app defaults to its "
-      + "current replacement; edit the field to use any model your key can access. "
-      + "Get a key at aistudio.google.com/apikey; usage may incur charges depending on your account."
+    ? "<b>Default: gemini-3.6-flash</b> (current stable model with image input). "
+      + "The Gemini 2.0 Flash from the original spec was shut down by Google on June 1, 2026, so this app "
+      + "defaults to its current replacement; edit the field to use any model your key can access. "
+      + "Get a key at aistudio.google.com/apikey; usage may incur charges depending on your account. "
+      + '<a href="https://aistudio.google.com/usage" target="_blank" rel="noopener">Check API usage and quota</a>.'
     : "<b>Default: gpt-5.4</b> (vision-capable). Needs an API key from platform.openai.com; "
       + "a ChatGPT subscription does not include API access, and API usage is billed separately per request.";
 }
