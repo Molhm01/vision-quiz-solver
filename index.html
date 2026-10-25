@@ -203,6 +203,7 @@ var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, rearm = false;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
+var flipCnt = null, prevMaskArr = null, sampleNo = 0;   // animated-cell tracking (ticking timers flip cells every tick)
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
 var autoPaused = false, dailyQuota = false, dailyProvider = null, consecFails = 0, lastPausedLog = 0;   // quota/error circuit breaker: no automatic calls while paused
@@ -448,6 +449,24 @@ function sample(){
     }
     var mask = bestMask;
     maskTotNow = bestCount;   // aligned changed-cell total this sample (noise measured <=27, full swap 100+)
+    // Animated-region suppression: a ticking countdown/timer flips the same cells
+    // changed<->unchanged every tick, forever; a real question change or text edit
+    // lands once and then holds. Cells caught flipping across consecutive samples
+    // are animated and excluded from the persistence ring below, so a visible timer
+    // cannot keep the latch hot and re-solve the SAME question (observed live: a
+    // duplicate Groq call 11s after the answer while only the timer was changing).
+    if (!flipCnt || flipCnt.length !== mask.length){ flipCnt = new Uint8Array(mask.length); prevMaskArr = null; }
+    // Flips accumulate fast, decay slowly (one decrement per 8 clean samples): a 1-Hz
+    // timer digit re-flips within ~2 samples and stays excluded, while a real edit
+    // flips once (score 1 < 2) and is never excluded.
+    sampleNo++;
+    if (prevMaskArr){
+      for (var ai = 0; ai < mask.length; ai++){
+        if (!!mask[ai] !== !!prevMaskArr[ai]){ if (flipCnt[ai] < 255) flipCnt[ai]++; }
+        else if (flipCnt[ai] > 0 && (sampleNo & 7) === 0) flipCnt[ai]--;
+      }
+    }
+    prevMaskArr = mask;
     var nowMs = performance.now();
     if (nowMs - lastRingPush >= 350){   // span the focus-hunt oscillation: 5 entries >= ~1.4s
       hotRing.push(mask);
@@ -468,8 +487,8 @@ function sample(){
           var pp = py * DET_W + px;
           var cc = cellCnt[pp];
           var ti = ((py / DET_TILE) | 0) * (DET_W / DET_TILE) + ((px / DET_TILE) | 0);
-          if (cc >= 3) tilesP[ti]++;
-          if (cc >= 5) tilesP5[ti]++;
+          if (cc >= 3 && flipCnt[pp] < 2) tilesP[ti]++;
+          if (cc >= 5 && flipCnt[pp] < 2) tilesP5[ti]++;
         }
       }
       for (var pt = 0; pt < tilesP.length; pt++){
@@ -496,6 +515,7 @@ function sample(){
   if (state === "solving" || state === "speaking"){ return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
+    if (window.__mock){ (window.__dbg = window.__dbg || []).push({ t: Math.round(performance.now()), rearm: rearm, fracRef: +fracRef.toFixed(4), refThr: +refThr.toFixed(4), fracPrev: +fracPrev.toFixed(4), structStreak: structStreak, chromaStreak: chromaStreak, latchStreak: latchStreak, persistHotNow: persistHotNow, maskTotNow: maskTotNow }); }
     if (!refGrid){ enterSettling(); return; }
     if (rearm){
       // Same-question dedup: right after an answer, only a change that persists across
@@ -575,6 +595,7 @@ function adoptReference(){
   }
   refEdgeDil = dilate(edgeMap(refDet));
   hotRing = []; lastRingPush = 0; editLatch = false; latchStreak = 0; structStreak = 0; chromaStreak = 0;   // ring entries were measured vs the old reference
+  flipCnt = null; prevMaskArr = null;
 }
 function enterSettling(){
   if (autoPaused){
@@ -703,19 +724,30 @@ async function doSolve(){
   }
   try {
     var dataUrl = captureJPEG();
-    var text = await askModel(cfg, dataUrl, aborter.signal);
+    var result = await askModel(cfg, dataUrl, aborter.signal);
     if (mySeq !== reqSeq) return;   // a newer trigger superseded this request
-    var m = (text || "").trim().match(/[A-Ea-e]/);
-    if (!m){
-      log("Unparsed reply: " + (text || "").slice(0, 60));
+    if (result.truncated){
+      // finish_reason "length" / MAX_TOKENS: the answer may be cut off mid-reasoning.
+      // Never speak a guess from a truncated reply.
+      log("Model reply truncated by the output budget - not speaking (provider hit its token cap)");
+      monitorStatus = "Model reply truncated - see log"; monitorClass = "error";
+      setStatus(monitorStatus, monitorClass);
+      resumeMonitor(3000);
+      return;
+    }
+    var clean = (result.text || "").replace(/<think>[\s\S]*?<\/think>/gi, " ");
+    var toks = clean.match(/\b[A-Ea-e]\b/g) || [];
+    if (!toks.length){
+      log("Unparsed reply: " + (result.text || "").slice(0, 60));
       monitorStatus = "No answer parsed"; monitorClass = "error";
       setStatus(monitorStatus, monitorClass);
       resumeMonitor(2500);
       return;
     }
+    if (toks.length > 1) log("Reply contained several letters (" + toks.join(", ") + ") - using the last one");
     consecFails = 0;
     dailyQuota = false; dailyProvider = null;
-    speakAnswer(m[0].toUpperCase(), mySeq);
+    speakAnswer(toks[toks.length - 1].toUpperCase(), mySeq);
   } catch (e) {
     if (e && e.name === "AbortError") return;
     var raw = (e && e.message ? String(e.message) : String(e));
@@ -770,9 +802,10 @@ async function askModel(cfg, dataUrl, signal){
     });
     if (!res.ok) throw new Error("Gemini HTTP " + res.status + ": " + (await res.text()).slice(0, 600));
     var j = await res.json();
-    var parts = (j.candidates && j.candidates[0] && j.candidates[0].content &&
-                 j.candidates[0].content.parts) || [];
-    return parts.map(function(p){ return p.text || ""; }).join("").trim();
+    var cand = (j.candidates && j.candidates[0]) || {};
+    var parts = (cand.content && cand.content.parts) || [];
+    return { text: parts.map(function(p){ return p.text || ""; }).join("").trim(),
+             truncated: cand.finishReason === "MAX_TOKENS" };
   } else {
     var api = PROVIDER_API[cfg.provider] || PROVIDER_API.openai;
     var res2 = await fetch(api.url, {
@@ -787,7 +820,9 @@ async function askModel(cfg, dataUrl, signal){
     });
     if (!res2.ok) throw new Error(api.label + " HTTP " + res2.status + ": " + (await res2.text()).slice(0, 600));
     var j2 = await res2.json();
-    return (((j2.choices || [])[0] || {}).message || {}).content || "";
+    var ch0 = (j2.choices || [])[0] || {};
+    return { text: ((ch0.message || {}).content || "").trim(),
+             truncated: ch0.finish_reason === "length" };
   }
 }
 
