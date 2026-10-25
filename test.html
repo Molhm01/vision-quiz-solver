@@ -334,7 +334,8 @@ var lastCr = null, lastCb = null, lastDet = null, lastDetCr = null, lastDetCb = 
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
 var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
-var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
+var structStreak = 0, chromaStreak = 0, sparseStreak = 0, bigStreak = 0;
+var hotRing = [];   // last 5 samples of hot sparse-tile lists
 var sharpHist = [], noiseHist = [];
 var monitorStatus = null, monitorClass = "";   // sticky status (e.g. API error) shown while monitoring
 
@@ -431,29 +432,25 @@ function dilate(e){
 }
 // Per-tile counts of (a) changed cells away from old edges and (b) newly appeared edges.
 // A sparse edit (one word/number/operator swapped at the same spot) barely moves the
-// whole-frame numbers, but it DOES flip cells that were flat in the reference: new ink
-// lands on background cells and old ink vanishes from stroke-interior cells. Focus
-// hunting and jitter only move pixels near existing edges (covered by refEdgeDil), and
-// pure color feedback is chroma-dominant - so "luma-dominant change on a ref-flat cell"
-// is unique to real text edits.
+// whole-frame numbers. Measured on the noisy mock (20px font): a one-word swap gives a
+// persistent cluster of luma-dominant changed cells in ONE region, while jitter/blur
+// noise hits random edge cells each sample and answer highlights are chroma-dominant.
+// So: hot tile = >=SPARSE_MIN luma-dominant changed cells; the SAME tile must stay hot
+// in >=3 of the last 5 samples - noise never holds a tile, a real edit always does.
 function sparseScan(det, detCr, detCb){
   var tilesC = new Uint16Array((DET_W / DET_TILE) * (DET_H / DET_TILE));
-  var hot = 0;
   for (var y = 0; y < DET_H; y++){
     for (var x = 0; x < DET_W; x++){
       var p = y * DET_W + x;
-      if (refEdgeDil[p]) continue;
       var dl = Math.abs(det[p] - refDet[p]);
       if (dl <= PIXEL_THR) continue;
       if (Math.abs(detCr[p] - refDetCr[p]) + Math.abs(detCb[p] - refDetCb[p]) > dl) continue;  // chroma feedback, not ink
-      var ti = ((y / DET_TILE) | 0) * (DET_W / DET_TILE) + ((x / DET_TILE) | 0);
-      tilesC[ti]++;
+      tilesC[((y / DET_TILE) | 0) * (DET_W / DET_TILE) + ((x / DET_TILE) | 0)]++;
     }
   }
-  for (var t = 0; t < tilesC.length; t++){
-    if (tilesC[t] >= SPARSE_MIN) hot++;
-  }
-  return hot;
+  var hotTiles = [];
+  for (var t = 0; t < tilesC.length; t++) if (tilesC[t] >= SPARSE_MIN) hotTiles.push(t);
+  return hotTiles;
 }
 
 function median(a){
@@ -543,41 +540,55 @@ function sample(){
   }
   structStreak = structural ? structStreak + 1 : 0;
   chromaStreak = chromatic ? chromaStreak + 1 : 0;
-  if (sparseHot > 0) sparseStreak++; else sparseStreak = 0;
-  var structuralHold = structStreak >= 2 || sparseStreak >= 2;
+  var sparseTiles = (refGrid && refDet) ? sparseScan(det, detCr, detCb) : [];
+  hotRing.push(sparseTiles);
+  if (hotRing.length > 5) hotRing.shift();
+  // same tile hot in >=3 of last 5 samples = a real localized edit; noise never holds a tile
+  var tileCounts = {};
+  for (var ri = 0; ri < hotRing.length; ri++)
+    for (var rj = 0; rj < hotRing[ri].length; rj++)
+      tileCounts[hotRing[ri][rj]] = (tileCounts[hotRing[ri][rj]] || 0) + 1;
+  var sparsePersist = false;
+  for (var tk in tileCounts) if (tileCounts[tk] >= 3){ sparsePersist = true; break; }
+  var manyHot = sparseTiles.length >= 5;   // widespread structural change (full question swap)
+  bigStreak = manyHot ? bigStreak + 1 : 0;
+  sparseHot = sparseTiles.length;
+  var structuralHold = structStreak >= 2 || sparsePersist;
   var chromaHold = chromaStreak >= 2 && !structural;
   lastDiff = fracRef;
   lastTile = sparseHot;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(2) + "%";
 
-  if ((state === "solving" || state === "speaking") && refGrid && structuralHold){ interruptBusy(); return; }
+  if ((state === "solving" || state === "speaking") && refGrid && (sparsePersist || bigStreak >= 2)){ interruptBusy(); return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
-    if (structuralHold || chromaHold){ enterSettling(); return; }
+    if (structuralHold || chromaHold || bigStreak >= 2){ enterSettling(); return; }
     return;
   }
   if (state === "settling"){
     var elapsed = performance.now() - settleStart;
-    // Identity re-check under persistence: the trigger may itself have been noise.
-    if (refGrid && !structuralHold && !chromatic && chromaStreak === 0 && elapsed > 500){
-      stopSettle();
-      log("Same question as before - not solving");
-      resumeMonitor(0);
-      return;
-    }
+    var realCandidate = sparsePersist || bigStreak >= 2;
     // Pure color feedback (answer highlight): adopt as the new reference, no solve.
-    if (refGrid && chromaHold && sparseStreak === 0){
+    if (refGrid && chromaHold && !realCandidate){
       stopSettle();
       adoptReference();
       log("Screen feedback noted - not a new question");
       resumeMonitor(0);
       return;
     }
+    // Identity re-check: the trigger may itself have been noise. The 80-grid structural
+    // signal alone never dispatches - blur/focus drift can hold it for seconds.
+    if (refGrid && !realCandidate && !chromatic && chromaStreak === 0 && elapsed > 800){
+      stopSettle();
+      log("Same question as before - not solving");
+      resumeMonitor(0);
+      return;
+    }
     var sharpMax = 0;
     for (var s2 = 0; s2 < sharpHist.length; s2++) if (sharpHist[s2] > sharpMax) sharpMax = sharpHist[s2];
     var clear = sharp >= SHARP_GATE * sharpMax;
-    if (fracPrev < stableThr && clear && elapsed >= SETTLE_MIN_MS){
+    if (fracPrev < stableThr && clear && elapsed >= SETTLE_MIN_MS && (realCandidate || !refGrid)){
       stopSettle();
       log("Scene stable and clear - solving");
       triggerSolve("auto");
@@ -585,10 +596,15 @@ function sample(){
     }
     if (!clear && !blurLogged && elapsed > 700){ blurLogged = true; log("Waiting for a clearer frame"); }
     if (elapsed >= SETTLE_MAX_MS){
-      // Guaranteed dispatch: never wait for perfect stillness or perfect sharpness.
       stopSettle();
-      log("Capturing best frame - solving");
-      triggerSolve("auto");
+      if (realCandidate || !refGrid){
+        // Guaranteed dispatch: never wait for perfect stillness or perfect sharpness.
+        log("Capturing best frame - solving");
+        triggerSolve("auto");
+      } else {
+        log("Same question as before - not solving");
+        resumeMonitor(0);
+      }
       return;
     }
   }
@@ -597,6 +613,7 @@ function adoptReference(){
   refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
   refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
   refEdgeDil = dilate(edgeMap(lastDet));
+  hotRing = []; structStreak = 0; chromaStreak = 0; bigStreak = 0;   // ring entries were measured vs the old reference
 }
 function enterSettling(){
   state = "settling";
@@ -651,7 +668,12 @@ async function doSolve(){
   clearInterval(monitorTimer); monitorTimer = null;
   if (busyTimer){ clearInterval(busyTimer); }
   busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
-  if (lastGrid){ refGrid = lastGrid; refCr = lastCr; refCb = lastCb; refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb; refEdgeDil = dilate(edgeMap(lastDet)); }  // the scene being solved becomes the reference
+  if (lastGrid){
+    refGrid = lastGrid; refCr = lastCr; refCb = lastCb;
+    refDet = lastDet; refDetCr = lastDetCr; refDetCb = lastDetCb;
+    refEdgeDil = dilate(edgeMap(lastDet));
+    hotRing = []; structStreak = 0; chromaStreak = 0; bigStreak = 0;
+  }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
   var cfg = getConfig();
