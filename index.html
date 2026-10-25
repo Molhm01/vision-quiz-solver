@@ -148,7 +148,7 @@ var PROMPT = "You are an automated multiple-choice quiz solver. Solve the questi
 
 var CMP_W = 80, CMP_H = 60;  // comparison grid: fine enough for quiz text, compared with alignment tolerance
 var SH_W = 96, SH_H = 72;    // finer grid for the sharpness (blur) estimate
-var MONITOR_MS = 400;         // frame sample cadence while watching
+var MONITOR_MS = 700;         // frame sample cadence while watching (low scan rate: phone can rest/move freely between questions)
 var BUSY_WATCH_MS = 400;      // watchdog cadence while solving/speaking/cooldown
 var SETTLE_MS = 150;          // faster cadence while waiting for a stable, clear frame
 var PIXEL_THR = 32;           // per-cell gray change (0-255) that counts a cell as changed
@@ -200,7 +200,7 @@ var refCr = null, refCb = null, refDet = null, refDetCr = null, refDetCb = null,
 var lastCr = null, lastCb = null, lastDet = null, lastDetCr = null, lastDetCb = null;
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleStart = 0, blurLogged = false;
-var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
+var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0, rearm = false;
 var structStreak = 0, chromaStreak = 0, sparseStreak = 0;
 var hotRing = [];   // last 5 luma-dominant change masks vs the reference
 var editLatch = false, latchStreak = 0, lastRingPush = 0;
@@ -489,13 +489,19 @@ function sample(){
   lastTile = sparseHot;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(2) + "%";
 
-  // Mid-solve interruption is reserved for a widespread persistent change (a full new
-  // question). A sparse edit mid-solve is not interrupted: the stale answer may speak,
-  // then monitoring detects the edit and solves the new question right after.
-  if ((state === "solving" || state === "speaking") && !autoPaused && refGrid && hotRing.length >= 5 && persistHot5 >= 4){ interruptBusy(); return; }
+  // Locked cycle: once a snapshot is taken it is solved and recited to the end. No
+  // scene change interrupts a solve or a recitation, and nothing is sampled while busy -
+  // the app only starts looking for a new question after the answer is given.
+  if (state === "solving" || state === "speaking"){ return; }
   if (state === "cooldown") return;   // quiet period; the monitoring pass right after re-checks the scene
   if (state === "monitoring"){
     if (!refGrid){ enterSettling(); return; }
+    if (rearm){
+      // Same-question dedup: right after an answer, only a change that persists across
+      // several consecutive evaluations re-arms detection - a noise burst cannot.
+      if (structStreak >= 4 || latchStreak >= 4 || chromaStreak >= 4){ rearm = false; enterSettling(); }
+      return;
+    }
     if (structuralHold || chromaHold || editLatch){ enterSettling(); return; }
     return;
   }
@@ -672,8 +678,7 @@ async function doSolve(){
   aborter = new AbortController();
   stopSettle();
   clearInterval(monitorTimer); monitorTimer = null;
-  if (busyTimer){ clearInterval(busyTimer); }
-  busyTimer = setInterval(sample, BUSY_WATCH_MS);   // keep watching for a mid-solve scene change
+  if (busyTimer){ clearInterval(busyTimer); busyTimer = null; }   // locked cycle: no sampling while busy
   if (lastGrid){ adoptReference(); }  // the scene being solved becomes the reference
   state = "solving";
   setStatus("Solving...", "solving");
@@ -778,7 +783,8 @@ function speakAnswer(letter, mySeq){
     done = true;
     if (mySeq !== reqSeq) return;   // superseded by a scene change: stay silent, stay settled
     state = "cooldown";
-    setStatus("Cooldown...", "");
+    setStatus("Answer given - watching for the next question...", "");
+    rearm = true;   // detection re-arms with extra persistence only after the answer is out
     var remain = COOLDOWN_MS - (Date.now() - lastSpokenAt);
     setTimeout(function(){ resumeMonitor(0, mySeq); }, Math.max(remain, 0));
   }
