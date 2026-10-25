@@ -283,7 +283,7 @@ var state = "idle";            // idle | monitoring | settling | solving | speak
 var stream = null, prevGrid = null, refGrid = null, lastGrid = null;
 var monitorTimer = null, settleTimer = null, busyTimer = null;
 var settleSince = 0, settleStart = 0, blurLogged = false;
-var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0;
+var lastSpokenAt = 0, reqSeq = 0, aborter = null, lastDiff = 0, lastTile = 0;
 var sharpHist = [];
 
 function setStatus(text, mode){
@@ -424,6 +424,7 @@ function sample(){
   if (prevGrid) fracPrev = maskStats(changedMask(gray, prevGrid)).frac;
   prevGrid = gray;
   lastDiff = fracRef;
+  lastTile = tileRef;
   diffMeter.textContent = "\u0394 " + (fracRef * 100).toFixed(1) + "%";
 
   if (state === "solving" && refGrid && (fracRef > CHANGE_FRAC || tileRef > TILE_FRAC)){ interruptBusy(); return; }
@@ -678,54 +679,29 @@ setStatus("Idle - tap Start Camera");
 window.__quizSolver = {
   get state(){ return state; },
   get lastDiff(){ return lastDiff; },
+  get lastTile(){ return lastTile; },
   solveNow: function(){ triggerSolve("manual"); }
 };
 </script>
 <script>
-// ===== TEST DRIVER (only present in test.html) =====
+// ===== DIAGNOSTIC DRIVER (metric probe run) =====
 (function(){
   var m = window.__mock, qs = window.__quizSolver;
   var T0 = performance.now();
-  function now(){ return Math.round(performance.now() - T0); }
-  function ev(s){ m.ev(s + " @" + now()); }
-  var lastState = null, stateLog = [];
-  var poller = setInterval(function(){
-    if (qs.state !== lastState){ stateLog.push({ t: now(), state: qs.state }); lastState = qs.state; }
-  }, 100);
+  var samples = [];
+  var poll = setInterval(function(){
+    samples.push({ t: Math.round(performance.now() - T0), state: qs.state,
+                   frac: +qs.lastDiff.toFixed(4), tile: +qs.lastTile.toFixed(3) });
+  }, 500);
   function at(ms, fn){ setTimeout(fn, ms); }
-
-  // Phase A (0-7s): static Q1, phone perfectly still -> must auto-solve and speak "Answer B"
-  at(100,   function(){ ev("start-click"); document.getElementById("btnStart").click(); });
-  // Phase B (7-12s): same Q1 with handheld jitter +-4px -> must NOT solve again
-  at(7000,  function(){ ev("jitter-on"); m.jitter = 4; });
-  // Phase C (12s): Q2 appears but heavily blurred -> detect change, wait for clarity, no solve yet
-  at(12000, function(){ ev("q2-blurred"); m.jitter = 0; m.blur = 12; m.scene = "Q2"; });
-  // Phase C2 (15s): picture clears -> must auto-solve and speak "Answer C"
-  at(15000, function(){ ev("q2-clear"); m.blur = 0; });
-  // Phase D (18.5-22s): static Q2 -> no duplicate solve
-  // Phase E (22s): Q3 with a slower API; mid-request scene change back to Q1 at 24.5s
-  at(22000, function(){ m.fetchDelay = 3000; m.scene = "Q3"; ev("q3"); });
-  at(24500, function(){ m.scene = "Q1"; ev("q1-again-midflight"); });
-  // Expect: Q3 request aborted, stale answer discarded, only Q1 re-solved and spoken ("Answer B")
-  // Phase F (34s): switch to realistic small-font text scene T1 -> must solve and speak "Answer D"
-  at(34000, function(){ m.textMode = true; m.scene = "T1"; ev("text-t1"); });
-  // Phase G (42s): full small-font question change T1 -> T2 -> must solve and speak "Answer A"
-  at(42000, function(){ m.scene = "T2"; ev("text-t2"); });
-  // Phase H (50s): sparse edit T2 -> T3 (one option word) -> MUST trigger and speak "Answer A"
-  at(50000, function(){ m.scene = "T3"; ev("text-t3-oneword"); });
-  // Phase I (54-64s): static T3 with only the corner timer ticking -> no further fetches
-  at(66000, function(){
-    clearInterval(poller);
-    var result = {
-      spoken: m.spoken,
-      fetches: m.fetches,
-      aborted: m.aborted,
-      events: m.events,
-      states: stateLog,
-      logs: Array.prototype.map.call(document.getElementById("log").children, function(d){ return d.textContent; })
-    };
-    window.__testResult = result;
-    console.log("TEST_RESULT " + JSON.stringify(result));
+  at(100, function(){ m.textMode = true; m.scene = "T1"; document.getElementById("btnStart").click(); });
+  // 0-10s: static small-text T1 with ticking corner timer (post-solve = noise floor)
+  at(10000, function(){ m.jitter = 4; });                    // 10-20s: + handheld jitter
+  at(20000, function(){ m.jitter = 0; m.scene = "T2"; });    // 20s: full small-text question change
+  at(30000, function(){ m.scene = "T3"; });                  // 30s: one-word option change
+  at(40000, function(){
+    clearInterval(poll);
+    window.__testResult = { samples: samples, fetches: m.fetches, spoken: m.spoken, events: m.events };
   });
 })();
 </script>
