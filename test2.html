@@ -1,0 +1,86 @@
+<!doctype html><html><head><meta charset="utf-8"><title>ocr-test</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+</head><body><canvas id="cv" width="1280" height="720"></canvas>
+<script>
+// Representative quiz-screen renderer (adapted from the app test harness mock)
+var cv = document.getElementById("cv"), c = cv.getContext("2d");
+var LINES = {
+  T1: ["What is the capital of France?", "A) Madrid", "B) Paris", "C) Rome", "D) Berlin"],
+  T2: ["Which planet is known as the Red Planet?", "A) Mars", "B) Venus", "C) Jupiter", "D) Mercury"],
+  T4: ["A train covers 60 km in 45 minutes.", "What is its average speed?", "A) 60 km/h", "B) 75 km/h", "C) 80 km/h", "D) 90 km/h"]
+};
+function mulberry(a){ return function(){ a|=0; a = a + 0x6D2B79F5 | 0; var t = Math.imul(a ^ a>>>15, 1|a); t = t + Math.imul(t ^ t>>>7, 61|t) ^ t; return ((t ^ t>>>14) >>> 0) / 4294967296; }; }
+var noiseFrames = [];
+for (var nf = 0; nf < 4; nf++){
+  var nc = document.createElement("canvas"); nc.width = 320; nc.height = 180;
+  var nctx = nc.getContext("2d");
+  var nid = nctx.createImageData(320, 180);
+  var nrnd = mulberry(777 + nf);
+  for (var np = 0; np < nid.data.length; np += 4){
+    if (nrnd() < 0.06){ var nv = 128 + Math.floor((nrnd()-0.5)*160); nid.data[np]=nid.data[np+1]=nid.data[np+2]=nv; nid.data[np+3]=255; }
+  }
+  nctx.putImageData(nid, 0, 0); noiseFrames.push(nc);
+}
+function draw(scene, opts){
+  opts = opts || {};
+  var blur = opts.blur || 0, jitter = opts.jitter || 0, glare = !!opts.glare, skew = opts.skew || 0, tick = opts.tick;
+  c.save();
+  c.filter = blur > 0.05 ? "blur(" + blur.toFixed(2) + "px)" : "none";
+  if (skew){ c.translate(640, 360); c.rotate(skew); c.translate(-640, -360); }
+  var amp = 1.5 + jitter, jx = (Math.random()*2-1)*amp, jy = (Math.random()*2-1)*amp;
+  c.translate(jx, jy);
+  c.fillStyle = "#101418"; c.fillRect(-80, -80, 1440, 880);
+  c.fillStyle = "#1c2530"; c.fillRect(100, 60, 1080, 600);
+  var lines = LINES[scene];
+  c.fillStyle = "#e8eef2";
+  c.font = "34px sans-serif";
+  for (var li = 0; li < lines.length; li++) c.fillText(lines[li], 160, 170 + li * 80);
+  c.font = "16px sans-serif";
+  c.fillText(tick != null ? tick : "0:" + String(Math.floor(performance.now()/1000)%60).padStart(2,"0"), 1100, 110);
+  if (glare){
+    var g = c.createLinearGradient(300, 0, 900, 720);
+    g.addColorStop(0, "rgba(255,255,255,0)"); g.addColorStop(0.5, "rgba(255,255,255,0.35)"); g.addColorStop(1, "rgba(255,255,255,0)");
+    c.fillStyle = g; c.fillRect(-80, -80, 1440, 880);
+  }
+  c.restore();
+  c.save(); c.filter = "none";
+  var fl = Math.sin(Date.now()/530) * 0.02;
+  c.fillStyle = fl >= 0 ? "rgba(255,255,255," + fl.toFixed(3) + ")" : "rgba(0,0,0," + (-fl).toFixed(3) + ")";
+  c.fillRect(0, 0, 1280, 720);
+  c.globalAlpha = 0.10; c.drawImage(noiseFrames[Math.floor(Math.random()*4)], 0, 0, 1280, 720);
+  c.restore();
+}
+function norm(s){ return (s||"").replace(/0:\d{2}/g, "").replace(/\s+/g, " ").trim().toLowerCase(); }
+window.__testResult = null;
+(async function(){
+  var R = { ua: navigator.userAgent.slice(0,80), initMs: null, cases: [], dedup: {}, error: null };
+  try {
+    var t0 = performance.now();
+    var worker = await Tesseract.createWorker("eng");
+    R.initMs = Math.round(performance.now() - t0);
+    async function ocr(name, scene, opts){
+      draw(scene, opts);
+      var t1 = performance.now();
+      var res = await worker.recognize(cv);
+      var dt = Math.round(performance.now() - t1);
+      var txt = res.data.text;
+      R.cases.push({ name: name, ms: dt, text: txt.replace(/\s+/g, " ").trim().slice(0, 300) });
+      return txt;
+    }
+    await ocr("T1-clean", "T1", {blur: 0.5});
+    await ocr("T4-arithmetic-clean", "T4", {blur: 0.5});
+    await ocr("T1-glare", "T1", {blur: 0.5, glare: true});
+    await ocr("T1-skew-jitter", "T1", {blur: 0.5, skew: 0.05, jitter: 3});
+    await ocr("T1-blur1.6", "T1", {blur: 1.6});
+    var a = await ocr("T1-tick-07", "T1", {blur: 0.5, tick: "0:07"});
+    var b = await ocr("T1-tick-43", "T1", {blur: 0.5, tick: "0:43"});
+    var d = await ocr("T2-different", "T2", {blur: 0.5});
+    R.dedup.sameQuestionTickerChanges = norm(a) === norm(b);
+    R.dedup.differentQuestion = norm(a) !== norm(d);
+    R.dedup.normA = norm(a).slice(0, 200); R.dedup.normB = norm(b).slice(0, 200); R.dedup.normD = norm(d).slice(0, 200);
+    await worker.terminate();
+    R.done = true;
+  } catch (e){ R.error = String((e && e.message) || e); }
+  window.__testResult = R;
+})();
+</script></body></html>
